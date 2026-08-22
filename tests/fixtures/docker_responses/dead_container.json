@@ -1,0 +1,17 @@
+{
+  "Id": "3030303030303030303030303030303030303030303030303030303030303c",
+  "Name": "/dead-container",
+  "Config": { "Image": "argus-fixtures/dead-container:1", "Labels": {} },
+  "State": {
+    "Status": "dead",
+    "Running": false,
+    "Paused": false,
+    "Restarting": false,
+    "Dead": true,
+    "ExitCode": 137,
+    "StartedAt": "2026-08-21T09:00:00.000000000Z",
+    "FinishedAt": "2026-08-21T09:00:30.000000000Z"
+  },
+  "RestartCount": 0,
+  "NetworkSettings": { "Ports": {} }
+}

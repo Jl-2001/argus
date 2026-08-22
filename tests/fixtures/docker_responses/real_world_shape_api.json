@@ -1,0 +1,23 @@
+{
+  "Id": "a0000000000000000000000000000000000000000000000000000000000pi1",
+  "Name": "/sample-project-api-1",
+  "Config": {
+    "Image": "sample-project-api",
+    "Labels": {
+      "com.docker.compose.project": "sample-project",
+      "com.docker.compose.service": "api"
+    }
+  },
+  "State": {
+    "Status": "exited",
+    "Running": false,
+    "Paused": false,
+    "Restarting": false,
+    "Dead": false,
+    "ExitCode": 137,
+    "StartedAt": "2026-08-09T16:32:56.221655045Z",
+    "FinishedAt": "2026-08-11T23:10:21.16776563Z"
+  },
+  "RestartCount": 0,
+  "NetworkSettings": { "Ports": {} }
+}

@@ -1,0 +1,17 @@
+{
+  "Id": "1010101010101010101010101010101010101010101010101010101010101a",
+  "Name": "/crash-looping-worker",
+  "Config": { "Image": "argus-fixtures/crash-looping-worker:1", "Labels": {} },
+  "State": {
+    "Status": "restarting",
+    "Running": false,
+    "Paused": false,
+    "Restarting": true,
+    "Dead": false,
+    "ExitCode": 1,
+    "StartedAt": "2026-08-21T09:00:00.000000000Z",
+    "FinishedAt": "2026-08-21T09:00:02.000000000Z"
+  },
+  "RestartCount": 12,
+  "NetworkSettings": { "Ports": {} }
+}

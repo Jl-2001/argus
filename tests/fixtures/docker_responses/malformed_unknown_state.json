@@ -1,0 +1,20 @@
+{
+  "Id": "8888888888888888888888888888888888888888888888888888888888888b",
+  "Name": "/mystery-container",
+  "Config": {
+    "Image": "argus-fixtures/mystery-container:1",
+    "Labels": {}
+  },
+  "State": {
+    "Status": "hibernating",
+    "Running": false,
+    "Paused": false,
+    "Restarting": false,
+    "Dead": false,
+    "ExitCode": 0,
+    "StartedAt": "2026-08-21T09:00:00.000000000Z",
+    "FinishedAt": "0001-01-01T00:00:00Z"
+  },
+  "RestartCount": 0,
+  "NetworkSettings": { "Ports": {} }
+}

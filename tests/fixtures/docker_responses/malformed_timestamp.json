@@ -1,0 +1,20 @@
+{
+  "Id": "9999999999999999999999999999999999999999999999999999999999999c",
+  "Name": "/clock-skewed",
+  "Config": {
+    "Image": "argus-fixtures/clock-skewed:1",
+    "Labels": {}
+  },
+  "State": {
+    "Status": "running",
+    "Running": true,
+    "Paused": false,
+    "Restarting": false,
+    "Dead": false,
+    "ExitCode": 0,
+    "StartedAt": "not-a-real-timestamp",
+    "FinishedAt": "0001-01-01T00:00:00Z"
+  },
+  "RestartCount": 0,
+  "NetworkSettings": { "Ports": {} }
+}

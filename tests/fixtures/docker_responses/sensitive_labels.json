@@ -1,0 +1,25 @@
+{
+  "Id": "6666666666666666666666666666666666666666666666666666666666666f",
+  "Name": "/metrics-agent",
+  "Config": {
+    "Image": "argus-fixtures/metrics-agent:1",
+    "Labels": {
+      "argus.owner": "jorge",
+      "com.example.random": "should-not-appear",
+      "some.secret.label": "should-not-appear-either",
+      "vendor.internal.build-path": "/home/dev/ci/build-42"
+    }
+  },
+  "State": {
+    "Status": "running",
+    "Running": true,
+    "Paused": false,
+    "Restarting": false,
+    "Dead": false,
+    "ExitCode": 0,
+    "StartedAt": "2026-08-21T09:00:00.000000000Z",
+    "FinishedAt": "0001-01-01T00:00:00Z"
+  },
+  "RestartCount": 0,
+  "NetworkSettings": { "Ports": {} }
+}

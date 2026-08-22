@@ -1,0 +1,20 @@
+{
+  "Id": "2222222222222222222222222222222222222222222222222222222222222b",
+  "Name": "/backup-job",
+  "Config": {
+    "Image": "argus-fixtures/backup-job:1",
+    "Labels": {}
+  },
+  "State": {
+    "Status": "exited",
+    "Running": false,
+    "Paused": false,
+    "Restarting": false,
+    "Dead": false,
+    "ExitCode": 0,
+    "StartedAt": "2026-08-21T03:00:00.000000000Z",
+    "FinishedAt": "2026-08-21T03:02:11.000000000Z"
+  },
+  "RestartCount": 0,
+  "NetworkSettings": { "Ports": {} }
+}

@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "argus"
+version = "0.1.0"
+description = "Deterministic infrastructure monitoring substrate for a personal environment."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "docker>=7.1,<8",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+argus = "argus.cli.main:main"
+
+[tool.setuptools.packages.find]
+include = ["argus*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+markers = [
+    "integration: end-to-end tests against a real, disposable Docker stack (argus-test-stack)",
+    "docker: tests that talk to a real Docker daemon",
+]

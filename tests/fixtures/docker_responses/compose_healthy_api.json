@@ -1,0 +1,38 @@
+{
+  "Id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "Name": "/cnstrct-api-1",
+  "Config": {
+    "Image": "cnstrct/api:latest",
+    "Labels": {
+      "com.docker.compose.config-hash": "sha256-fake0000000000000000000000000000000000000000000000000000000000",
+      "com.docker.compose.container-number": "1",
+      "com.docker.compose.depends_on": "postgres:service_healthy:true",
+      "com.docker.compose.oneoff": "False",
+      "com.docker.compose.project": "cnstrct",
+      "com.docker.compose.project.config_files": "/home/dev/projects/cnstrct/docker-compose.yml",
+      "com.docker.compose.project.working_dir": "/home/dev/projects/cnstrct",
+      "com.docker.compose.service": "api",
+      "com.docker.compose.version": "2.39.2",
+      "argus.owner": "jorge",
+      "some.secret.label": "should-not-appear",
+      "com.example.random": "should-not-appear-either"
+    }
+  },
+  "State": {
+    "Status": "running",
+    "Running": true,
+    "Paused": false,
+    "Restarting": false,
+    "Dead": false,
+    "ExitCode": 0,
+    "StartedAt": "2026-08-21T09:00:00.000000000Z",
+    "FinishedAt": "0001-01-01T00:00:00Z",
+    "Health": { "Status": "healthy", "FailingStreak": 0, "Log": [] }
+  },
+  "RestartCount": 0,
+  "NetworkSettings": {
+    "Ports": {
+      "8080/tcp": [{ "HostIp": "0.0.0.0", "HostPort": "8080" }]
+    }
+  }
+}

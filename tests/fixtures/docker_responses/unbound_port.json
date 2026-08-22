@@ -1,0 +1,24 @@
+{
+  "Id": "4444444444444444444444444444444444444444444444444444444444444d",
+  "Name": "/internal-db",
+  "Config": {
+    "Image": "argus-fixtures/internal-db:1",
+    "Labels": {}
+  },
+  "State": {
+    "Status": "running",
+    "Running": true,
+    "Paused": false,
+    "Restarting": false,
+    "Dead": false,
+    "ExitCode": 0,
+    "StartedAt": "2026-08-21T09:00:00.000000000Z",
+    "FinishedAt": "0001-01-01T00:00:00Z"
+  },
+  "RestartCount": 0,
+  "NetworkSettings": {
+    "Ports": {
+      "5432/tcp": null
+    }
+  }
+}

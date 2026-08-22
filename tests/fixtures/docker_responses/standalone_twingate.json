@@ -1,0 +1,20 @@
+{
+  "Id": "1111111111111111111111111111111111111111111111111111111111111a",
+  "Name": "/twingate-connector",
+  "Config": {
+    "Image": "twingate/connector:1",
+    "Labels": {}
+  },
+  "State": {
+    "Status": "running",
+    "Running": true,
+    "Paused": false,
+    "Restarting": false,
+    "Dead": false,
+    "ExitCode": 0,
+    "StartedAt": "2026-08-20T08:00:00.000000000Z",
+    "FinishedAt": "0001-01-01T00:00:00Z"
+  },
+  "RestartCount": 0,
+  "NetworkSettings": { "Ports": {} }
+}

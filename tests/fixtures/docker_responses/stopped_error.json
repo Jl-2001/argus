@@ -1,0 +1,20 @@
+{
+  "Id": "3333333333333333333333333333333333333333333333333333333333333c",
+  "Name": "/flaky-worker",
+  "Config": {
+    "Image": "argus-fixtures/flaky-worker:1",
+    "Labels": {}
+  },
+  "State": {
+    "Status": "exited",
+    "Running": false,
+    "Paused": false,
+    "Restarting": false,
+    "Dead": false,
+    "ExitCode": 137,
+    "StartedAt": "2026-08-21T03:00:00.000000000Z",
+    "FinishedAt": "2026-08-21T03:00:05.000000000Z"
+  },
+  "RestartCount": 2,
+  "NetworkSettings": { "Ports": {} }
+}

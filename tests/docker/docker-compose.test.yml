@@ -1,0 +1,52 @@
+# Disposable stack for Argus's Milestone 9 end-to-end / chaos tests.
+#
+# `name:` pins the Compose project name explicitly to "argus-test-stack"
+# regardless of which directory `docker compose` is invoked from -- this
+# is the exact label (`com.docker.compose.project`) the test suite's
+# safety guard checks before allowing any mutation. No secrets, no host
+# volumes, no host port mappings -- nothing here needs to be reachable
+# from outside the Docker network Compose creates for it.
+name: argus-test-stack
+
+services:
+  healthy-api:
+    image: nginx:alpine
+    # A deliberately wide `interval` (well over the test collector's 2s
+    # poll_interval) so a (re)start produces a real, multi-poll-wide
+    # "starting" window -- nginx itself responds instantly, so without
+    # this the starting state could pass before Argus ever polls it,
+    # per Milestone 9's "adjust healthcheck timing to create a
+    # deterministic starting window" guidance.
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost"]
+      interval: 6s
+      timeout: 2s
+      retries: 3
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 3
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: test
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 2s
+      retries: 5
+
+  # Started only for the crash-loop scenario, and stopped again
+  # immediately after -- see conftest.py's `failure_service` fixture.
+  # Left running for the whole session, this would make the
+  # application-level rollup permanently unhealthy and break every
+  # other scenario's "recovers to HEALTHY" assertion.
+  intentional-failure-service:
+    image: alpine
+    command: sh -c "sleep 2 && exit 1"
+    restart: always

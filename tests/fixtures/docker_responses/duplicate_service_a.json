@@ -1,0 +1,24 @@
+{
+  "Id": "aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111",
+  "Name": "/dupproj-web-1",
+  "Config": {
+    "Image": "argus-fixtures/dupproj-web:1",
+    "Labels": {
+      "com.docker.compose.project": "dupproj",
+      "com.docker.compose.service": "web"
+    }
+  },
+  "State": {
+    "Status": "running",
+    "Running": true,
+    "Paused": false,
+    "Restarting": false,
+    "Dead": false,
+    "ExitCode": 0,
+    "StartedAt": "2026-08-21T09:00:00.000000000Z",
+    "FinishedAt": "0001-01-01T00:00:00Z",
+    "Health": { "Status": "healthy", "FailingStreak": 0, "Log": [] }
+  },
+  "RestartCount": 0,
+  "NetworkSettings": { "Ports": {} }
+}
