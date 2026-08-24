@@ -33,6 +33,11 @@ __all__ = [
     "Observation",
     "Service",
     "Application",
+    "EvidenceCategory",
+    "EvidenceSeverity",
+    "EVIDENCE_SEVERITY_RANK",
+    "evidence_severity_rank",
+    "EvidenceRecord",
 ]
 
 
@@ -500,4 +505,171 @@ class Application:
             is_standalone=data["is_standalone"],
             services=tuple(Service.from_dict(s) for s in data.get("services", [])),
             derived_status=data["derived_status"],
+        )
+
+
+# --------------------------------------------------------------------------
+# Evidence -- Milestone 10
+#
+# Argus already knows *what* changed (Observation/HealthStatus) and *when*
+# (health_transitions/incidents, Milestones 4/6). Evidence answers a third,
+# separate question: *what else was going on* around that change --
+# structured, bounded, redacted facts pulled from container logs and Docker
+# facts, not a free-form blob and not an AI-generated explanation. See
+# ``argus/evidence/`` for the deterministic collection pipeline that
+# produces these; this module only defines the shape.
+# --------------------------------------------------------------------------
+
+
+class EvidenceCategory(str, Enum):
+    """A fixed, deliberately small set of deterministic evidence categories.
+
+    Two categories (``CONTAINER_RESTART``, ``CONTAINER_UNHEALTHY``) are
+    derived directly from Docker facts (restart_count deltas, health
+    status), never from log text. Every other category is only ever
+    produced by matching a container's log lines against
+    ``argus.evidence.patterns.DEFAULT_PATTERNS`` -- never inferred, never
+    guessed, never assigned by a model.
+    """
+
+    DB_CONNECTION_TIMEOUT = "db_connection_timeout"
+    AUTHENTICATION_FAILURE = "authentication_failure"
+    PORT_CONFLICT = "port_conflict"
+    MISSING_ENVIRONMENT_VARIABLE = "missing_environment_variable"
+    HTTP_5XX = "http_5xx"
+    OOM = "oom"
+    DISK_PRESSURE = "disk_pressure"
+    NETWORK_FAILURE = "network_failure"
+    DEPENDENCY_UNAVAILABLE = "dependency_unavailable"
+    CONTAINER_RESTART = "container_restart"
+    CONTAINER_UNHEALTHY = "container_unhealthy"
+    GENERIC_ERROR = "generic_error"
+
+
+class EvidenceSeverity(str, Enum):
+    """Four explicit levels -- never inferred from enum declaration order
+    or string sort. See ``EVIDENCE_SEVERITY_RANK`` for the explicit
+    ranking, matching the same pattern already used for
+    ``HealthStatus`` in ``argus.domain.health`` /
+    ``argus.incidents.engine``.
+    """
+
+    INFO = "info"
+    WARNING = "warning"
+    HIGH = "high"
+    CRITICAL = "critical"
+
+
+#: Explicit rank, higher is worse. A plain dict keyed by enum member --
+#: never enum declaration order, never the member's string value -- same
+#: discipline as ``argus.domain.health._APPLICATION_SEVERITY_RANK`` and
+#: ``argus.incidents.engine._INCIDENT_SEVERITY_RANK``.
+EVIDENCE_SEVERITY_RANK: dict[EvidenceSeverity, int] = {
+    EvidenceSeverity.INFO: 1,
+    EvidenceSeverity.WARNING: 2,
+    EvidenceSeverity.HIGH: 3,
+    EvidenceSeverity.CRITICAL: 4,
+}
+
+
+def evidence_severity_rank(severity: "EvidenceSeverity") -> int:
+    return EVIDENCE_SEVERITY_RANK[severity]
+
+
+#: The only valid values for EvidenceRecord.source_type -- a log line
+#: read from a container's stdout/stderr stream, or a fact Argus already
+#: had on hand from Docker itself (restart_count, health status) without
+#: reading any log at all.
+EVIDENCE_SOURCE_TYPES = frozenset({"container_log", "docker_fact"})
+
+
+def _as_evidence_category(value: "EvidenceCategory | str") -> EvidenceCategory:
+    return value if isinstance(value, EvidenceCategory) else EvidenceCategory(value)
+
+
+def _as_evidence_severity(value: "EvidenceSeverity | str") -> EvidenceSeverity:
+    return value if isinstance(value, EvidenceSeverity) else EvidenceSeverity(value)
+
+
+@dataclass(frozen=True, slots=True)
+class EvidenceRecord:
+    """One aggregated, structured piece of evidence.
+
+    Deliberately does *not* carry an ``incident_id`` field, even though
+    early sketches of this shape suggested one: an evidence record must
+    be linkable to an incident *before that incident exists yet* (see
+    "Evidence Before Incident Open" in the Milestone 10 spec) and, in
+    principle, could turn out to be near more than one incident's
+    window. Both are a many-to-many relationship over time, not a
+    single foreign key on this row -- so the association lives in its
+    own link table (``incident_evidence`` / ``IncidentEvidenceRecord``
+    in ``argus.store.repository``), never here.
+
+    ``count``/``first_seen_at``/``last_seen_at`` describe one
+    *aggregated* signal (see ``argus.evidence.aggregator``), never a
+    single raw line held forever -- ``sample`` is one bounded,
+    already-redacted representative example, not a log dump.
+    """
+
+    id: Optional[int]
+    application_key: str
+    container_id: str
+    category: EvidenceCategory
+    severity: EvidenceSeverity
+    first_seen_at: datetime
+    last_seen_at: datetime
+    count: int
+    sample: str
+    source_type: str
+    source_ref: str
+
+    def __post_init__(self) -> None:
+        if self.id is not None and (not isinstance(self.id, int) or isinstance(self.id, bool)):
+            raise TypeError("id must be an int or None")
+        _require_nonempty_str(self.application_key, "application_key")
+        _require_nonempty_str(self.container_id, "container_id")
+        object.__setattr__(self, "category", _as_evidence_category(self.category))
+        object.__setattr__(self, "severity", _as_evidence_severity(self.severity))
+        _require_utc(self.first_seen_at, "first_seen_at")
+        _require_utc(self.last_seen_at, "last_seen_at")
+        if self.last_seen_at < self.first_seen_at:
+            raise ValueError("last_seen_at cannot be before first_seen_at")
+        if not isinstance(self.count, int) or isinstance(self.count, bool) or self.count < 1:
+            raise ValueError("count must be a positive int")
+        _require_nonempty_str(self.sample, "sample")
+        if self.source_type not in EVIDENCE_SOURCE_TYPES:
+            raise ValueError(
+                f"source_type must be one of {sorted(EVIDENCE_SOURCE_TYPES)}, got {self.source_type!r}"
+            )
+        _require_nonempty_str(self.source_ref, "source_ref")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "application_key": self.application_key,
+            "container_id": self.container_id,
+            "category": self.category.value,
+            "severity": self.severity.value,
+            "first_seen_at": self.first_seen_at.isoformat(),
+            "last_seen_at": self.last_seen_at.isoformat(),
+            "count": self.count,
+            "sample": self.sample,
+            "source_type": self.source_type,
+            "source_ref": self.source_ref,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "EvidenceRecord":
+        return cls(
+            id=data.get("id"),
+            application_key=data["application_key"],
+            container_id=data["container_id"],
+            category=data["category"],
+            severity=data["severity"],
+            first_seen_at=datetime.fromisoformat(data["first_seen_at"]),
+            last_seen_at=datetime.fromisoformat(data["last_seen_at"]),
+            count=data["count"],
+            sample=data["sample"],
+            source_type=data["source_type"],
+            source_ref=data["source_ref"],
         )

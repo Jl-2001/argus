@@ -163,7 +163,7 @@ def all_transitions(conn: sqlite3.Connection, scope: str | None = None) -> list[
 class TestSchemaMigrationV2ToV3:
     def test_fresh_database_has_health_transitions_and_incidents(self, tmp_path):
         conn = open_database(tmp_path / "a.db")
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 6  # SCHEMA_VERSION moved to 6 in Milestone 12.1 (multi-provider AI)
         tables = {
             row["name"]
             for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
@@ -199,7 +199,7 @@ class TestSchemaMigrationV2ToV3:
         v2_conn.close()
 
         conn = open_database(db_path)
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 6  # SCHEMA_VERSION moved to 6 in Milestone 12.1 (multi-provider AI)
         tables = {
             row["name"]
             for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
@@ -219,7 +219,7 @@ class TestSchemaMigrationV2ToV3:
         conn.close()
 
         conn2 = open_database(db_path)
-        assert conn2.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert conn2.execute("PRAGMA user_version").fetchone()[0] == 6  # SCHEMA_VERSION moved to 6 in Milestone 12.1 (multi-provider AI)
         assert Repository(conn2).get_application("cnstrct") is not None
         conn2.close()
 

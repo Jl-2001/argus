@@ -27,9 +27,18 @@ from argus.collectors.docker_client import (
 
 
 class FakeContainer:
-    def __init__(self, id: str, attrs: dict):
+    def __init__(self, id: str, attrs: dict, log_bytes: bytes = b"", log_error: BaseException | None = None):
         self.id = id
         self.attrs = attrs
+        self._log_bytes = log_bytes
+        self._log_error = log_error
+        self.logs_calls: list[dict] = []
+
+    def logs(self, **kwargs):
+        self.logs_calls.append(kwargs)
+        if self._log_error is not None:
+            raise self._log_error
+        return self._log_bytes
 
 
 class FakeContainersAPI:
@@ -117,6 +126,62 @@ class TestInspectContainer:
         client = DockerClient(client=fake)
         with pytest.raises(DockerUnavailableError):
             client.inspect_container("id-1")
+
+
+# --------------------------------------------------------------------------
+# get_logs
+# --------------------------------------------------------------------------
+
+from datetime import datetime, timezone  # noqa: E402  (grouped near first use, matching this file's style)
+
+
+class TestGetLogs:
+    def test_returns_decoded_lines(self):
+        raw = b"2026-08-22T10:00:00.000000000Z first line\n2026-08-22T10:00:01.000000000Z second line\n"
+        container = FakeContainer("id-1", {}, log_bytes=raw)
+        client = DockerClient(client=FakeSDKClient(get_results={"id-1": container}))
+
+        lines = client.get_logs("id-1")
+
+        assert lines == [
+            "2026-08-22T10:00:00.000000000Z first line",
+            "2026-08-22T10:00:01.000000000Z second line",
+        ]
+
+    def test_passes_tail_and_since_through(self):
+        container = FakeContainer("id-1", {}, log_bytes=b"")
+        client = DockerClient(client=FakeSDKClient(get_results={"id-1": container}))
+        since = datetime(2026, 8, 22, 10, 0, 0, tzinfo=timezone.utc)
+
+        client.get_logs("id-1", since=since, tail=42)
+
+        assert container.logs_calls == [
+            {"stdout": True, "stderr": True, "timestamps": True, "tail": 42, "since": since}
+        ]
+
+    def test_omits_since_kwarg_when_none(self):
+        container = FakeContainer("id-1", {}, log_bytes=b"")
+        client = DockerClient(client=FakeSDKClient(get_results={"id-1": container}))
+
+        client.get_logs("id-1", since=None, tail=10)
+
+        assert "since" not in container.logs_calls[0]
+
+    def test_vanished_container_raises(self):
+        client = DockerClient(client=FakeSDKClient(get_results={}))
+        with pytest.raises(ContainerVanishedError):
+            client.get_logs("gone")
+
+    def test_docker_unavailable_during_logs_raises_typed_error(self):
+        container = FakeContainer("id-1", {}, log_error=docker.errors.DockerException("boom"))
+        client = DockerClient(client=FakeSDKClient(get_results={"id-1": container}))
+        with pytest.raises(DockerUnavailableError):
+            client.get_logs("id-1")
+
+    def test_empty_logs_returns_empty_list(self):
+        container = FakeContainer("id-1", {}, log_bytes=b"")
+        client = DockerClient(client=FakeSDKClient(get_results={"id-1": container}))
+        assert client.get_logs("id-1") == []
 
 
 # --------------------------------------------------------------------------

@@ -10,6 +10,9 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "docker>=7.1,<8",
+    "anthropic>=0.40,<1",
+    "google-genai>=2.19,<3",
+    "httpx>=0.27",
 ]
 
 [project.optional-dependencies]
@@ -27,4 +30,5 @@ pythonpath = ["."]
 markers = [
     "integration: end-to-end tests against a real, disposable Docker stack (argus-test-stack)",
     "docker: tests that talk to a real Docker daemon",
+    "ai: tests that make a real Anthropic API call (skipped unless ANTHROPIC_API_KEY is set)",
 ]

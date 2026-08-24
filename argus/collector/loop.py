@@ -1,32 +1,67 @@
 """The long-running collector loop.
 
-Wires together three already-complete layers on a timer:
+Wires together these already-complete layers on a timer:
 
     argus.collectors.docker_collector.discover()   -- Milestone 3
     (the evaluations discover() already computed)  -- Milestone 2, via M3
     argus.store.repository.Repository.persist_discovery()  -- Milestone 4
+    argus.evidence (log/evidence collection)        -- Milestone 10
+    argus.incidents.engine.process_transitions_and_incidents()  -- Milestone 6
+    argus.evidence.association (incident <-> evidence linking)  -- Milestone 10
 
-This module contains no discovery logic, no health rules, and no
-persistence mechanics of its own -- only scheduling, failure
-classification, and backoff. ``run_once()`` is one deterministic
-collection attempt; ``run_forever()`` is the scheduling wrapper around
-it. Tests target ``run_once()`` almost exclusively, with a clock and a
-sleep function both injected so nothing here depends on real wall-clock
-time.
+This module contains no discovery logic, no health rules, no
+persistence mechanics, and no evidence-classification logic of its own
+-- only scheduling, ordering, failure classification, and backoff.
+``run_once()`` is one deterministic collection attempt; ``run_forever()``
+is the scheduling wrapper around it. Tests target ``run_once()`` almost
+exclusively, with a clock and a sleep function both injected so nothing
+here depends on real wall-clock time.
+
+Tick ordering (Milestone 10 extends the Milestone 6 pipeline)::
+
+    1. discover -> evaluate
+    2. persist observations                  (core monitoring truth)
+    3. collect + persist evidence             (auxiliary -- see below)
+    4. detect transitions, open/resolve incidents
+    5. associate evidence with incidents      (auxiliary -- see below)
+
+Steps 3 and 5 are evidence collection's two halves, and both are
+*isolated* from core monitoring: a Docker log read failing for one
+container, an evidence-persistence error, or an association-query
+failure never fails the tick (`TickResult.success` is untouched by
+either) -- it is recorded as its own, separate failure via
+`Repository.record_evidence_tick_failure`, exactly so a problem in the
+auxiliary evidence subsystem can never make core health monitoring look
+down. Evidence collection deliberately runs *after* observations are
+persisted (so `application_id`/`container_id` row ids already exist to
+attach evidence to) but *before* transition/incident detection --
+placing it any later would mean incident detection never sees evidence
+collected in the very same tick a status changed. Association
+deliberately runs *after* transition/incident detection, since it needs
+to know this tick's own incident open/resolve outcome to compute each
+incident's current window.
 """
 
 from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Optional, Sequence
 
 from argus.collectors.docker_client import DockerClient, DockerUnavailableError
 from argus.collectors.docker_collector import discover
 from argus.domain.health import DEFAULT_HEALTH_RULES, HealthRules
-from argus.domain.models import Observation
+from argus.domain.models import DockerHealth, EvidenceCategory, Observation
+from argus.evidence.association import DEFAULT_ASSOCIATION_WINDOW_SECONDS, associate_evidence
+from argus.evidence.collector import (
+    DEFAULT_EVIDENCE_LIMITS,
+    EvidenceCollectionLimits,
+    collect_evidence_for_container,
+    docker_fact_evidence,
+)
+from argus.evidence.persistence import persist_candidates
 from argus.incidents.engine import IncidentProcessingError, process_transitions_and_incidents
 from argus.store.database import PersistenceError
 from argus.store.repository import Repository, resolve_observation_health
@@ -64,6 +99,20 @@ class CollectorConfig:
     backoff_initial: float = 15.0
     backoff_max: float = 60.0
 
+    #: Milestone 10 -- evidence collection. ``collect_evidence=False`` is
+    #: a full kill-switch (skips steps 3/5 entirely, e.g. for a v0.1-only
+    #: deployment that isn't ready for the extra Docker log reads yet);
+    #: the rest tune the bounds ``argus.evidence.collector`` and
+    #: ``argus.evidence.association`` apply. None of these are folded
+    #: into `HealthRules` -- they configure a different subsystem
+    #: entirely (what evidence to collect, not what health status to
+    #: compute), so conflating the two would make both harder to reason
+    #: about independently.
+    collect_evidence: bool = True
+    evidence_limits: EvidenceCollectionLimits = field(default_factory=lambda: DEFAULT_EVIDENCE_LIMITS)
+    evidence_association_window_seconds: int = DEFAULT_ASSOCIATION_WINDOW_SECONDS
+    evidence_retention_days: int = 14
+
     def __post_init__(self) -> None:
         if self.poll_interval <= 0:
             raise ValueError("poll_interval must be positive")
@@ -71,6 +120,8 @@ class CollectorConfig:
             raise ValueError("backoff_initial must be positive")
         if self.backoff_max < self.backoff_initial:
             raise ValueError("backoff_max must be >= backoff_initial")
+        if self.evidence_retention_days <= 0:
+            raise ValueError("evidence_retention_days must be positive")
 
 
 DEFAULT_COLLECTOR_CONFIG = CollectorConfig()
@@ -133,6 +184,16 @@ class TickResult:
     Milestone 6's ``IncidentProcessingResult`` -- see
     ``argus.incidents.engine`` -- and are always ``0`` on a failed tick,
     same as the discovery counts above them.
+
+    ``evidence_signals_created``/``evidence_associations`` and
+    ``evidence_error`` (Milestone 10) are deliberately independent of
+    ``success``/``error`` above: an evidence-subsystem failure never
+    fails the tick (see this module's docstring), so
+    ``evidence_error is not None`` can be true even when
+    ``success is True``. Conversely, on a failed *core* tick (discovery/
+    persistence/transitions), evidence collection never ran at all this
+    tick, so both evidence fields are ``0``/``None`` regardless of the
+    evidence subsystem's own health.
     """
 
     success: bool
@@ -145,6 +206,9 @@ class TickResult:
     incidents_opened: int = 0
     incidents_updated: int = 0
     incidents_resolved: int = 0
+    evidence_signals_created: int = 0
+    evidence_associations: int = 0
+    evidence_error: Optional[str] = None
     error: Optional[str] = None
 
 
@@ -249,12 +313,26 @@ class CollectorLoop:
         except MissingEvaluationError as exc:
             return self._fail(exc)
 
+        # Captured *before* persisting this tick's new observations, so
+        # "before" genuinely means the previous tick's reading -- used
+        # only for Milestone 10's restart-count-delta evidence below.
+        previous_observation_by_container_id = {
+            observation.container_ref.container_id: self._repository.get_latest_observation(
+                observation.container_ref.container_id
+            )
+            for observation in resolved_observations
+        }
+
         try:
             self._repository.persist_discovery(
                 applications=result.applications, observations=resolved_observations
             )
         except PersistenceError as exc:
             return self._fail(exc)
+
+        evidence_signals_created, evidence_error = self._collect_and_persist_evidence(
+            result, resolved_observations, previous_observation_by_container_id, tick_at
+        )
 
         try:
             container_statuses = {
@@ -269,6 +347,31 @@ class CollectorLoop:
         except (IncidentProcessingError, PersistenceError) as exc:
             return self._fail(exc)
 
+        evidence_associations, association_error = self._associate_evidence(tick_at)
+
+        # Exactly one evidence-heartbeat update per tick, combining both
+        # halves' outcomes -- see _associate_evidence's own docstring for
+        # why this must not be two separate record_evidence_tick_*
+        # calls. Collection's own error takes precedence when both
+        # halves failed (it ran first, and association's own failure is
+        # often just a downstream consequence of nothing new to find).
+        #
+        # When `collect_evidence` is off, the heartbeat is left
+        # completely untouched (no success, no failure) -- recording a
+        # "success" for a subsystem that was never even asked to run
+        # would misrepresent it as active; `None`/`0` already means
+        # "never run" (see `CollectorStateRecord`'s own docstring), which
+        # is the honest state here.
+        combined_evidence_error = evidence_error if evidence_error is not None else association_error
+        if self._config.collect_evidence:
+            if combined_evidence_error is None:
+                self._repository.record_evidence_tick_success(at=tick_at)
+            else:
+                try:
+                    self._repository.record_evidence_tick_failure(error=combined_evidence_error)
+                except PersistenceError:
+                    logger.error("could not record evidence tick failure to collector_state (database unavailable?)")
+
         self._repository.record_tick_success(at=tick_at)
 
         if result.skipped:
@@ -278,13 +381,16 @@ class CollectorLoop:
             )
         logger.info(
             "collector tick succeeded: %d application(s), %d observation(s), "
-            "%d transition(s), %d incident(s) opened/%d updated/%d resolved",
+            "%d transition(s), %d incident(s) opened/%d updated/%d resolved, "
+            "%d evidence signal(s), %d evidence association(s)",
             len(result.applications),
             len(resolved_observations),
             incident_result.transitions_created,
             incident_result.incidents_opened,
             incident_result.incidents_updated,
             incident_result.incidents_resolved,
+            evidence_signals_created,
+            evidence_associations,
         )
 
         return TickResult(
@@ -298,6 +404,9 @@ class CollectorLoop:
             incidents_opened=incident_result.incidents_opened,
             incidents_updated=incident_result.incidents_updated,
             incidents_resolved=incident_result.incidents_resolved,
+            evidence_signals_created=evidence_signals_created,
+            evidence_associations=evidence_associations,
+            evidence_error=combined_evidence_error,
             error=None,
         )
 
@@ -320,6 +429,157 @@ class CollectorLoop:
             return self._repository.get_observations_after(container_id, after=lookback)
 
         return provider
+
+    def _collect_and_persist_evidence(
+        self,
+        result,
+        resolved_observations: list[Observation],
+        previous_observation_by_container_id: dict[str, Optional[Observation]],
+        tick_at: datetime,
+    ) -> tuple[int, Optional[str]]:
+        """Milestone 10, tick step 3: collect and persist evidence for
+        every container this tick successfully observed.
+
+        Deliberately never raises -- any failure here is caught,
+        recorded via ``record_evidence_tick_failure`` (its own,
+        independent heartbeat -- see ``CollectorStateRecord``), and
+        reported back as ``(0, error_message)`` rather than failing the
+        whole tick. A single container's Docker log read failing is
+        *already* isolated one layer down, inside
+        ``collect_evidence_for_container`` itself; the broad
+        ``except Exception`` here exists for the layer above that --
+        e.g. a genuinely unexpected bug in this method's own
+        orchestration, or a repository write failing -- exactly
+        mirroring the documented, deliberate outer safety net
+        ``run_forever`` already uses around a whole tick, scoped here to
+        just the evidence subsystem so a bug in it can never make core
+        health monitoring look down.
+
+        Returns ``(signals_created, error_message_or_None)``.
+        """
+
+        if not self._config.collect_evidence:
+            return 0, None
+
+        try:
+            signals_created = 0
+            limits = self._config.evidence_limits
+            resolved_by_container_id = {
+                observation.container_ref.container_id: observation for observation in resolved_observations
+            }
+
+            containers_capped = False
+            for application in result.applications:
+                if containers_capped:
+                    break
+                application_record = self._repository.get_application(application.key)
+                if application_record is None:
+                    continue
+
+                for service in application.services:
+                    if containers_capped:
+                        break
+                    for container in service.containers:
+                        if signals_created >= limits.max_signals_per_tick:
+                            logger.warning(
+                                "evidence signal cap (%d) reached this tick -- remaining "
+                                "container(s) will be collected on a later tick, not skipped "
+                                "permanently; no cursor was advanced for them",
+                                limits.max_signals_per_tick,
+                            )
+                            containers_capped = True
+                            break
+
+                        container_id = container.container_id
+                        observation = resolved_by_container_id.get(container_id)
+                        if observation is None:
+                            continue
+                        container_record = self._repository.get_container_by_docker_id(container_id)
+                        if container_record is None:
+                            continue
+
+                        cursor_after = self._repository.get_log_cursor(container_record.id)
+                        log_result = collect_evidence_for_container(
+                            self._docker_client, container_id,
+                            cursor_after=cursor_after, tick_at=tick_at, limits=limits,
+                        )
+                        if log_result.error is not None:
+                            logger.warning(
+                                "evidence log collection skipped for container %s this tick: %s",
+                                container_id, log_result.error,
+                            )
+
+                        if log_result.candidates:
+                            signals_created += persist_candidates(
+                                self._repository, list(log_result.candidates),
+                                application_id=application_record.id, container_row_id=container_record.id,
+                                source_type="container_log", source_ref="stdout+stderr",
+                                aggregation_window_seconds=limits.aggregation_window_seconds,
+                            )
+                        if log_result.new_cursor_at is not None:
+                            self._repository.set_log_cursor(
+                                container_record.id, last_log_at=log_result.new_cursor_at, updated_at=tick_at
+                            )
+
+                        previous_observation = previous_observation_by_container_id.get(container_id)
+                        fact_candidates = docker_fact_evidence(
+                            observed_at=tick_at,
+                            restart_count_before=(
+                                previous_observation.restart_count if previous_observation is not None else None
+                            ),
+                            restart_count_after=observation.restart_count,
+                            docker_health_is_unhealthy=(observation.docker_health is DockerHealth.UNHEALTHY),
+                        )
+                        for candidate in fact_candidates:
+                            source_ref = (
+                                "restart_count" if candidate.category is EvidenceCategory.CONTAINER_RESTART
+                                else "docker_health"
+                            )
+                            signals_created += persist_candidates(
+                                self._repository, [candidate],
+                                application_id=application_record.id, container_row_id=container_record.id,
+                                source_type="docker_fact", source_ref=source_ref,
+                                aggregation_window_seconds=limits.aggregation_window_seconds,
+                            )
+
+            retention_cutoff = tick_at - timedelta(days=self._config.evidence_retention_days)
+            self._repository.delete_expired_log_signals(before=retention_cutoff)
+
+            return signals_created, None
+        except Exception as exc:  # noqa: BLE001 -- deliberate, documented, scoped safety net; see docstring
+            message = _sanitize_error(exc)
+            logger.warning("evidence collection failed this tick (core monitoring unaffected): %s", message)
+            return 0, message
+
+    def _associate_evidence(self, tick_at: datetime) -> tuple[int, Optional[str]]:
+        """Milestone 10, tick step 5: link evidence to incidents by time
+        proximity (see ``argus.evidence.association``). Runs after
+        transition/incident detection, since it needs this tick's own
+        open/resolve outcome. Never raises, for the same reason as
+        ``_collect_and_persist_evidence``.
+
+        Returns ``(associations_made, error_message_or_None)`` -- the
+        caller (``run_once``) combines this with
+        ``_collect_and_persist_evidence``'s own result into exactly
+        *one* evidence-heartbeat update per tick (see ``run_once``'s own
+        comment on why: recording two separate failures for what is
+        conceptually one tick's evidence subsystem would double-count
+        `consecutive_evidence_failures`).
+        """
+
+        if not self._config.collect_evidence:
+            return 0, None
+
+        try:
+            associations = associate_evidence(
+                self._repository, now=tick_at,
+                window_seconds=self._config.evidence_association_window_seconds,
+            )
+            return associations, None
+        except Exception as exc:  # noqa: BLE001 -- deliberate, documented, scoped safety net; see docstring above
+            message = _sanitize_error(exc)
+            logger.warning("evidence association failed this tick (core monitoring unaffected): %s", message)
+            return 0, message
 
     def _resolve_observations(self, result) -> list[Observation]:
         """Bridge each Observation with its already-computed HealthEvaluation.

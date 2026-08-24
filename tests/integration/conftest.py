@@ -269,6 +269,22 @@ def failure_service(stack):
 
 
 @pytest.fixture
+def log_emitter(stack):
+    """Starts `log-emitter` (see the compose file's own comment) only for
+    Milestone 10's evidence scenario, and stops/removes it again
+    immediately after -- same isolation pattern as `failure_service`.
+    """
+
+    compose_up("log-emitter")
+    try:
+        container_id = compose_container_id("log-emitter")
+        yield container_id
+    finally:
+        compose_stop("log-emitter")
+        compose_rm("log-emitter")
+
+
+@pytest.fixture
 def argus_db(tmp_path):
     """A fresh, temporary Argus SQLite database per test -- never the
     real ./data/argus.db. Removed (including -wal/-shm) on teardown."""

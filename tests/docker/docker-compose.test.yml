@@ -50,3 +50,27 @@ services:
     image: alpine
     command: sh -c "sleep 2 && exit 1"
     restart: always
+
+  # Milestone 10 -- emits a fixed, known sequence of log lines (a normal
+  # startup line, three identical db-timeout-shaped lines close together,
+  # and one line containing a fake Bearer token) then sleeps, so evidence
+  # collection has real, deterministic Docker log output to read.
+  # Started only for the evidence scenario -- see conftest.py's
+  # `log_emitter` fixture -- and stopped/removed again immediately after,
+  # for the same "don't permanently perturb other scenarios" reason as
+  # intentional-failure-service above.
+  log-emitter:
+    image: alpine
+    command: >
+      sh -c "
+      echo 'normal startup line';
+      sleep 1;
+      echo 'database connection timeout';
+      sleep 1;
+      echo 'database connection timeout';
+      sleep 1;
+      echo 'database connection timeout';
+      sleep 1;
+      echo 'authentication failed, Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PYVsLquNPYJI';
+      sleep 3600
+      "

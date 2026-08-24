@@ -23,9 +23,10 @@ from datetime import datetime
 from typing import Optional, Sequence
 
 from argus.domain.health import DEFAULT_HEALTH_RULES, HealthRules
-from argus.domain.models import HealthStatus
+from argus.domain.models import EvidenceCategory, EvidenceSeverity, HealthStatus
 from argus.store.repository import (
     ApplicationCountsRecord,
+    EvidenceRecord,
     IncidentWithApplicationRecord,
     Repository,
     TransitionHistoryRow,
@@ -38,6 +39,7 @@ __all__ = [
     "ContainerDetail",
     "ServiceDetail",
     "ApplicationDetail",
+    "EvidenceView",
     "get_collector_status",
     "list_application_summaries",
     "get_application_detail",
@@ -45,6 +47,8 @@ __all__ = [
     "list_history",
     "find_application_key",
     "suggest_application_name",
+    "list_evidence_for_application",
+    "list_evidence_for_incident",
 ]
 
 
@@ -361,3 +365,78 @@ def list_history(
         return None
     record = repository.get_application(key)
     return repository.list_transitions_for_application(record.id, since=since)
+
+
+# --------------------------------------------------------------------------
+# Evidence -- Milestone 10
+#
+# Like incidents/history above, evidence is a historical fact record,
+# not a "current status" -- it needs no staleness reinterpretation. This
+# layer's only real job is resolving a signal's raw `container_id` into
+# a human-facing `source_label` (the owning service's compose_service
+# name, or the container's own name for a standalone container) --
+# exactly the same "display_name" resolution `get_application_detail`
+# already does per service, applied here per evidence signal instead.
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class EvidenceView:
+    category: EvidenceCategory
+    severity: EvidenceSeverity
+    count: int
+    first_seen_at: datetime
+    last_seen_at: datetime
+    sample: str
+    source_label: str
+    source_type: str
+    container_id: str
+
+
+def _resolve_source_label(repository: Repository, container_id: str) -> str:
+    container_record = repository.get_container_by_docker_id(container_id)
+    if container_record is None:
+        return container_id
+    service_record = repository.get_service(container_record.service_id)
+    if service_record is not None and service_record.compose_service is not None:
+        return service_record.compose_service
+    return container_record.name
+
+
+def _to_evidence_view(repository: Repository, signal: EvidenceRecord) -> EvidenceView:
+    return EvidenceView(
+        category=signal.category,
+        severity=signal.severity,
+        count=signal.count,
+        first_seen_at=signal.first_seen_at,
+        last_seen_at=signal.last_seen_at,
+        sample=signal.sample,
+        source_label=_resolve_source_label(repository, signal.container_id),
+        source_type=signal.source_type,
+        container_id=signal.container_id,
+    )
+
+
+def list_evidence_for_application(
+    repository: Repository, *, name_or_key: str, since: datetime
+) -> Optional[list[EvidenceView]]:
+    """Evidence for one application since `since`, newest-last-seen
+    first, or None if `name_or_key` matches no application."""
+
+    key = find_application_key(repository, name_or_key)
+    if key is None:
+        return None
+    record = repository.get_application(key)
+    signals = repository.list_log_signals_for_application(record.id, since=since)
+    return [_to_evidence_view(repository, signal) for signal in signals]
+
+
+def list_evidence_for_incident(repository: Repository, *, incident_id: int) -> Optional[list[EvidenceView]]:
+    """Evidence linked to one incident, chronological, or None if
+    `incident_id` matches no incident at all (as opposed to a real
+    incident simply having no evidence linked, which is `[]`)."""
+
+    if repository.get_incident_by_id(incident_id) is None:
+        return None
+    signals = repository.list_evidence_for_incident(incident_id)
+    return [_to_evidence_view(repository, signal) for signal in signals]

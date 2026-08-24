@@ -30,12 +30,20 @@ from argus.domain.models import (
     Container,
     DockerHealth,
     DockerState,
+    EvidenceCategory,
+    EvidenceRecord,
+    EvidenceSeverity,
     HealthStatus,
     Observation,
     PortBinding,
     Service,
 )
-from argus.store.database import DuplicateIncidentError, DuplicateObservationError, PersistenceError
+from argus.store.database import (
+    DuplicateExplanationError,
+    DuplicateIncidentError,
+    DuplicateObservationError,
+    PersistenceError,
+)
 
 __all__ = [
     "ApplicationRecord",
@@ -49,6 +57,9 @@ __all__ = [
     "TransitionHistoryRow",
     "TRANSITION_SCOPES",
     "PersistDiscoveryReport",
+    "IncidentEvidenceRecord",
+    "ObservationRecord",
+    "ExplanationRecord",
     "Repository",
     "resolve_observation_health",
 ]
@@ -158,12 +169,23 @@ class CollectorStateRecord:
 
     ``None`` fields mean "no tick has ever recorded this yet" (a brand
     new database), not a real timestamp.
+
+    The three ``evidence_*`` fields (schema v4, Milestone 10) are the
+    *evidence* subsystem's own, separate liveness -- deliberately not
+    folded into ``last_tick_at``/``last_success_at``/
+    ``consecutive_failures``/``last_error`` above, which stay about core
+    discovery/health monitoring only. A container's log stream being
+    briefly unreadable must never look like core monitoring itself
+    failed.
     """
 
     last_tick_at: datetime | None
     last_success_at: datetime | None
     consecutive_failures: int
     last_error: str | None
+    last_evidence_success_at: datetime | None = None
+    consecutive_evidence_failures: int = 0
+    last_evidence_error: str | None = None
 
 
 #: The only valid values for health_transitions.scope / incidents.scope --
@@ -241,7 +263,15 @@ class IncidentWithApplicationRecord:
 class TransitionHistoryRow:
     """One row of `list_transitions_for_application()` -- a transition
     with its human-facing label already resolved (``"application"``, or
-    the owning compose_service/container name), not a raw `scope_id`."""
+    the owning compose_service/container name), not a raw `scope_id`.
+
+    ``container_docker_id`` (Milestone 11) is Docker's own container id
+    when ``scope == "container"``, and ``None`` for application/service
+    scope rows -- added so the evidence assembler can look up
+    observations near a container-scope transition without a second
+    per-row query. Defaulted so every existing caller (``argus history``)
+    that never references it is unaffected.
+    """
 
     id: int
     scope: str
@@ -249,6 +279,7 @@ class TransitionHistoryRow:
     from_status: HealthStatus | None
     to_status: HealthStatus
     occurred_at: datetime
+    container_docker_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -257,6 +288,54 @@ class PersistDiscoveryReport:
     services_written: int
     containers_written: int
     observations_written: int
+
+
+@dataclass(frozen=True, slots=True)
+class IncidentEvidenceRecord:
+    """One row of ``incident_evidence`` -- links one log_signal to one
+    incident by time proximity only. ``relation`` is always
+    ``"temporal_proximity"`` in v0.2 (enforced by the schema's own CHECK
+    constraint) -- see ``argus.evidence.association`` for why this must
+    never be read as "caused_by"."""
+
+    id: int
+    incident_id: int
+    log_signal_id: int
+    linked_at: datetime
+    relation: str
+
+
+@dataclass(frozen=True, slots=True)
+class ExplanationRecord:
+    """One row of ``incident_explanations`` (Milestone 12, extended in
+    12.1 with ``provider``) -- a validated, trusted AI explanation,
+    already persisted, from *some* provider. Never holds an API key, a
+    raw unredacted log, or a system prompt. ``summary``/``root_cause``/
+    ``confidence`` are denormalized copies of fields already inside
+    ``response_json`` (the full serialized
+    ``argus.ai.models.IncidentExplanation``), kept as their own columns
+    purely so a human or a future query can see them without parsing
+    JSON. This module never imports ``argus.ai`` -- reconstructing the
+    real ``IncidentExplanation`` object from ``response_json`` is
+    ``argus.ai``'s own job (``IncidentExplanation.from_dict``), not
+    this one's. ``provider`` is a plain string here (e.g. ``"anthropic"``/
+    ``"gemini"``), not ``argus.ai.providers.AIProviderName`` -- this
+    module has no reason to depend on that enum.
+    """
+
+    id: int
+    incident_id: int
+    bundle_fingerprint: str
+    provider: str
+    model: str
+    prompt_version: str
+    created_at: datetime
+    summary: str
+    root_cause: str | None
+    confidence: str
+    input_tokens: int | None
+    output_tokens: int | None
+    response_json: str
 
 
 def _row_to_application_record(row: sqlite3.Row) -> ApplicationRecord:
@@ -306,6 +385,11 @@ def _row_to_collector_state_record(row: sqlite3.Row | None) -> CollectorStateRec
         ),
         consecutive_failures=row["consecutive_failures"],
         last_error=row["last_error"],
+        last_evidence_success_at=_optional_text_to_dt(
+            row["last_evidence_success_at"], field_name="collector_state.last_evidence_success_at"
+        ),
+        consecutive_evidence_failures=row["consecutive_evidence_failures"],
+        last_evidence_error=row["last_evidence_error"],
     )
 
 
@@ -371,7 +455,64 @@ def _row_to_transition_history_row(row: sqlite3.Row) -> TransitionHistoryRow:
         from_status=HealthStatus(row["from_status"]) if row["from_status"] is not None else None,
         to_status=HealthStatus(row["to_status"]),
         occurred_at=_text_to_dt(row["occurred_at"], field_name="health_transitions.occurred_at"),
+        container_docker_id=row["container_docker_id"] if "container_docker_id" in row.keys() else None,
     )
+
+
+def _row_to_evidence_record(row: sqlite3.Row) -> EvidenceRecord:
+    return EvidenceRecord(
+        id=row["id"],
+        application_key=row["application_key"],
+        container_id=row["docker_container_id"],
+        category=EvidenceCategory(row["category"]),
+        severity=EvidenceSeverity(row["severity"]),
+        first_seen_at=_text_to_dt(row["first_seen_at"], field_name="log_signals.first_seen_at"),
+        last_seen_at=_text_to_dt(row["last_seen_at"], field_name="log_signals.last_seen_at"),
+        count=row["count"],
+        sample=row["sample"],
+        source_type=row["source_type"],
+        source_ref=row["source_ref"],
+    )
+
+
+def _row_to_incident_evidence_record(row: sqlite3.Row) -> IncidentEvidenceRecord:
+    return IncidentEvidenceRecord(
+        id=row["id"],
+        incident_id=row["incident_id"],
+        log_signal_id=row["log_signal_id"],
+        linked_at=_text_to_dt(row["linked_at"], field_name="incident_evidence.linked_at"),
+        relation=row["relation"],
+    )
+
+
+def _row_to_explanation_record(row: sqlite3.Row) -> ExplanationRecord:
+    return ExplanationRecord(
+        id=row["id"],
+        incident_id=row["incident_id"],
+        bundle_fingerprint=row["bundle_fingerprint"],
+        provider=row["provider"],
+        model=row["model"],
+        prompt_version=row["prompt_version"],
+        created_at=_text_to_dt(row["created_at"], field_name="incident_explanations.created_at"),
+        summary=row["summary"],
+        root_cause=row["root_cause"],
+        confidence=row["confidence"],
+        input_tokens=row["input_tokens"],
+        output_tokens=row["output_tokens"],
+        response_json=row["response_json"],
+    )
+
+
+_LOG_SIGNAL_JOIN = """
+    SELECT
+        ls.id, ls.application_id, ls.container_id, ls.category, ls.severity,
+        ls.normalized_signature, ls.first_seen_at, ls.last_seen_at, ls.count,
+        ls.sample, ls.source_type, ls.source_ref,
+        a.key AS application_key, c.container_id AS docker_container_id
+    FROM log_signals ls
+    JOIN applications a ON a.id = ls.application_id
+    JOIN containers c ON c.id = ls.container_id
+"""
 
 
 _OBSERVATION_JOIN = """
@@ -408,6 +549,27 @@ def _row_to_container_ref(row: sqlite3.Row) -> Container:
             row["container_last_seen_at"], field_name="containers.last_seen_at"
         ),
     )
+
+
+@dataclass(frozen=True, slots=True)
+class ObservationRecord:
+    """An `Observation` paired with its own database row id.
+
+    `Observation` itself (the domain object -- Milestone 1) deliberately
+    carries no row id at all; it's a pure point-in-time value, and every
+    existing caller of `get_observation_history`/`get_latest_observation`/
+    `get_observations_after` only ever needed the observation's own
+    fields, never a citable database identity for it. Milestone 11's
+    evidence assembler is the first caller that needs both at once (to
+    build a stable ``"observation:<id>"`` citation reference) -- rather
+    than retrofit an `id` field onto `Observation` itself (which every
+    other constructor call site across the whole codebase would then
+    need to supply), the three observation-lookup methods built for the
+    assembler return this small pairing instead.
+    """
+
+    id: int
+    observation: Observation
 
 
 def _row_to_observation(row: sqlite3.Row) -> Observation:
@@ -489,6 +651,64 @@ def resolve_observation_health(
         derived_status=status,
         derived_detail=detail,
     )
+
+
+# --------------------------------------------------------------------------
+# Shared transitions-in-a-window SQL (list_transitions_for_application /
+# get_transitions_in_window both use this shape; only the container-scope
+# branch's ORDER BY/WHERE bound differs). Wrapped in an outer SELECT so
+# ORDER BY unambiguously refers to the combined result's own column
+# names -- SQLite's compound-SELECT column-name rules for a bare ORDER
+# BY on a UNION ALL are fragile otherwise. `container_docker_id` is NULL
+# for application/service-scope rows -- only a container-scope
+# transition has one.
+# --------------------------------------------------------------------------
+
+_TRANSITIONS_QUERY_LOWER_BOUND_ONLY = (
+    "SELECT * FROM ("
+    "  SELECT ht.id, ht.scope, ht.from_status, ht.to_status, ht.occurred_at, "
+    "         'application' AS label, NULL AS container_docker_id "
+    "  FROM health_transitions ht "
+    "  JOIN applications a ON a.id = ht.scope_id "
+    "  WHERE ht.scope = 'application' AND a.id = ? AND ht.occurred_at >= ? "
+    "  UNION ALL "
+    "  SELECT ht.id, ht.scope, ht.from_status, ht.to_status, ht.occurred_at, "
+    "         COALESCE(s.compose_service, s.name) AS label, NULL AS container_docker_id "
+    "  FROM health_transitions ht "
+    "  JOIN services s ON s.id = ht.scope_id "
+    "  WHERE ht.scope = 'service' AND s.application_id = ? AND ht.occurred_at >= ? "
+    "  UNION ALL "
+    "  SELECT ht.id, ht.scope, ht.from_status, ht.to_status, ht.occurred_at, "
+    "         COALESCE(s.compose_service, c.name) AS label, c.container_id AS container_docker_id "
+    "  FROM health_transitions ht "
+    "  JOIN containers c ON c.id = ht.scope_id "
+    "  JOIN services s ON s.id = c.service_id "
+    "  WHERE ht.scope = 'container' AND s.application_id = ? AND ht.occurred_at >= ? "
+    ") ORDER BY occurred_at ASC, id ASC"
+)
+
+_TRANSITIONS_QUERY_BOTH_BOUNDS = (
+    "SELECT * FROM ("
+    "  SELECT ht.id, ht.scope, ht.from_status, ht.to_status, ht.occurred_at, "
+    "         'application' AS label, NULL AS container_docker_id "
+    "  FROM health_transitions ht "
+    "  JOIN applications a ON a.id = ht.scope_id "
+    "  WHERE ht.scope = 'application' AND a.id = ? AND ht.occurred_at >= ? AND ht.occurred_at <= ? "
+    "  UNION ALL "
+    "  SELECT ht.id, ht.scope, ht.from_status, ht.to_status, ht.occurred_at, "
+    "         COALESCE(s.compose_service, s.name) AS label, NULL AS container_docker_id "
+    "  FROM health_transitions ht "
+    "  JOIN services s ON s.id = ht.scope_id "
+    "  WHERE ht.scope = 'service' AND s.application_id = ? AND ht.occurred_at >= ? AND ht.occurred_at <= ? "
+    "  UNION ALL "
+    "  SELECT ht.id, ht.scope, ht.from_status, ht.to_status, ht.occurred_at, "
+    "         COALESCE(s.compose_service, c.name) AS label, c.container_id AS container_docker_id "
+    "  FROM health_transitions ht "
+    "  JOIN containers c ON c.id = ht.scope_id "
+    "  JOIN services s ON s.id = c.service_id "
+    "  WHERE ht.scope = 'container' AND s.application_id = ? AND ht.occurred_at >= ? AND ht.occurred_at <= ? "
+    ") ORDER BY occurred_at ASC, id ASC"
+)
 
 
 class Repository:
@@ -773,12 +993,42 @@ class Repository:
         ).fetchone()
         return _row_to_application_record(row) if row is not None else None
 
+    def get_application_by_id(self, application_id: int) -> ApplicationRecord | None:
+        """Look up one application by its own row id -- added for
+        Milestone 11's evidence assembler, which starts from an
+        incident's `scope_id` (an application row id) rather than a
+        human-typed name/key."""
+
+        row = self._conn.execute(
+            "SELECT id, key, name, is_standalone, first_seen_at, last_seen_at "
+            "FROM applications WHERE id = ?",
+            (application_id,),
+        ).fetchone()
+        return _row_to_application_record(row) if row is not None else None
+
     def list_applications(self) -> tuple[ApplicationRecord, ...]:
         rows = self._conn.execute(
             "SELECT id, key, name, is_standalone, first_seen_at, last_seen_at "
             "FROM applications ORDER BY key"
         ).fetchall()
         return tuple(_row_to_application_record(row) for row in rows)
+
+    def get_service(self, service_id: int) -> ServiceRecord | None:
+        """Look up one service by its own row id -- a plain primary-key
+        read, added for Milestone 10's evidence CLI (which resolves a
+        `log_signals.container_id` back to its owning service's
+        `compose_service` label for display). Every other existing
+        service lookup either goes by `(application_id, compose_service)`
+        (`get_service_by_key`) or lists every service for one application
+        (`get_services_for_application`); neither fits "I already have a
+        container's own `service_id`, resolve it directly"."""
+
+        row = self._conn.execute(
+            "SELECT id, application_id, compose_service, name, first_seen_at, last_seen_at "
+            "FROM services WHERE id = ?",
+            (service_id,),
+        ).fetchone()
+        return _row_to_service_record(row) if row is not None else None
 
     def get_services_for_application(self, application_id: int) -> tuple[ServiceRecord, ...]:
         rows = self._conn.execute(
@@ -839,6 +1089,54 @@ class Repository:
         ).fetchall()
         return tuple(_row_to_observation(row) for row in rows)
 
+    def get_observation_before(self, container_id: str, *, before: datetime) -> ObservationRecord | None:
+        """The single most recent observation strictly before `before`,
+        paired with its own row id, or `None` if none exists. Added for
+        Milestone 11's observation sampling ("one before a transition")
+        -- the mirror image of `get_observations_after`, but bounded to
+        exactly one row rather than a whole tail, and carrying the row
+        id `get_observations_after`'s plain `Observation` results don't
+        (see `ObservationRecord`)."""
+
+        row = self._conn.execute(
+            _OBSERVATION_JOIN + " WHERE c.container_id = ? AND o.observed_at < ? "
+            "ORDER BY o.observed_at DESC LIMIT 1",
+            (container_id, _dt_to_text(before)),
+        ).fetchone()
+        return ObservationRecord(id=row["id"], observation=_row_to_observation(row)) if row is not None else None
+
+    def get_observation_at(self, container_id: str, *, at: datetime) -> ObservationRecord | None:
+        """The observation at exactly `at`, paired with its own row id,
+        or `None`. Added for Milestone 11: a health transition's own
+        `occurred_at` is, by construction (see the Milestone 6/9
+        timestamp-accuracy hardening), the exact `observed_at` of the
+        observation that first proved the new status -- this looks that
+        observation up directly rather than re-deriving it."""
+
+        row = self._conn.execute(
+            _OBSERVATION_JOIN + " WHERE c.container_id = ? AND o.observed_at = ?",
+            (container_id, _dt_to_text(at)),
+        ).fetchone()
+        return ObservationRecord(id=row["id"], observation=_row_to_observation(row)) if row is not None else None
+
+    def get_observation_after(self, container_id: str, *, after: datetime) -> ObservationRecord | None:
+        """The single earliest observation strictly after `after`,
+        paired with its own row id, or `None`. The singular counterpart
+        to `get_observation_before`/`get_observation_at`, added for
+        Milestone 11 -- deliberately a separate method from the
+        pre-existing, plural `get_observations_after` (Milestone 6),
+        which returns a whole tail of plain `Observation` values with no
+        row id and has its own established callers (the incident
+        engine's history provider) this must not disturb.
+        """
+
+        row = self._conn.execute(
+            _OBSERVATION_JOIN + " WHERE c.container_id = ? AND o.observed_at > ? "
+            "ORDER BY o.observed_at ASC LIMIT 1",
+            (container_id, _dt_to_text(after)),
+        ).fetchone()
+        return ObservationRecord(id=row["id"], observation=_row_to_observation(row)) if row is not None else None
+
     # ---------------------------------------------------------------
     # Collector heartbeat (schema v2, Milestone 5)
     #
@@ -851,7 +1149,8 @@ class Repository:
 
     def get_collector_state(self) -> CollectorStateRecord:
         row = self._conn.execute(
-            "SELECT last_tick_at, last_success_at, consecutive_failures, last_error "
+            "SELECT last_tick_at, last_success_at, consecutive_failures, last_error, "
+            "       last_evidence_success_at, consecutive_evidence_failures, last_evidence_error "
             "FROM collector_state WHERE id = 1"
         ).fetchone()
         return _row_to_collector_state_record(row)
@@ -897,6 +1196,43 @@ class Repository:
             (error,),
         )
         return self.get_collector_state().consecutive_failures
+
+    # ---------------------------------------------------------------
+    # Evidence-collector heartbeat (schema v4, Milestone 10)
+    #
+    # Deliberately separate from record_tick_*/get_collector_state's core
+    # fields above -- see CollectorStateRecord's own docstring for why.
+    # ---------------------------------------------------------------
+
+    def record_evidence_tick_success(self, *, at: datetime) -> None:
+        """Mark that evidence collection completed without error this
+        tick -- resets the evidence failure streak. Called even when zero
+        signals were found: "succeeded and found nothing" and "succeeded
+        and found something" are both success."""
+
+        self._conn.execute(
+            "INSERT INTO collector_state (id, last_evidence_success_at, "
+            " consecutive_evidence_failures, last_evidence_error) "
+            "VALUES (1, ?, 0, NULL) "
+            "ON CONFLICT(id) DO UPDATE SET last_evidence_success_at = excluded.last_evidence_success_at, "
+            "consecutive_evidence_failures = 0, last_evidence_error = NULL",
+            (_dt_to_text(at),),
+        )
+
+    def record_evidence_tick_failure(self, *, error: str) -> int:
+        """Mark that evidence collection/persistence failed this tick.
+        ``last_evidence_success_at`` is left untouched. Returns the new
+        ``consecutive_evidence_failures`` count."""
+
+        self._conn.execute(
+            "INSERT INTO collector_state (id, consecutive_evidence_failures, last_evidence_error) "
+            "VALUES (1, 1, ?) "
+            "ON CONFLICT(id) DO UPDATE SET "
+            "consecutive_evidence_failures = consecutive_evidence_failures + 1, "
+            "last_evidence_error = excluded.last_evidence_error",
+            (error,),
+        )
+        return self.get_collector_state().consecutive_evidence_failures
 
     def get_service_by_key(
         self, *, application_id: int, compose_service: str | None
@@ -1107,35 +1443,319 @@ class Repository:
         """
 
         since_text = _dt_to_text(since)
-        # Wrapped in an outer SELECT so ORDER BY unambiguously refers to the
-        # combined result's own column names -- SQLite's compound-SELECT
-        # column-name rules for a bare ORDER BY on a UNION ALL are fragile
-        # otherwise.
         rows = self._conn.execute(
-            "SELECT * FROM ("
-            "  SELECT ht.id, ht.scope, ht.from_status, ht.to_status, ht.occurred_at, "
-            "         'application' AS label "
-            "  FROM health_transitions ht "
-            "  JOIN applications a ON a.id = ht.scope_id "
-            "  WHERE ht.scope = 'application' AND a.id = ? AND ht.occurred_at >= ? "
-            "  UNION ALL "
-            "  SELECT ht.id, ht.scope, ht.from_status, ht.to_status, ht.occurred_at, "
-            "         COALESCE(s.compose_service, s.name) AS label "
-            "  FROM health_transitions ht "
-            "  JOIN services s ON s.id = ht.scope_id "
-            "  WHERE ht.scope = 'service' AND s.application_id = ? AND ht.occurred_at >= ? "
-            "  UNION ALL "
-            "  SELECT ht.id, ht.scope, ht.from_status, ht.to_status, ht.occurred_at, "
-            "         COALESCE(s.compose_service, c.name) AS label "
-            "  FROM health_transitions ht "
-            "  JOIN containers c ON c.id = ht.scope_id "
-            "  JOIN services s ON s.id = c.service_id "
-            "  WHERE ht.scope = 'container' AND s.application_id = ? AND ht.occurred_at >= ? "
-            ") ORDER BY occurred_at ASC, id ASC",
+            _TRANSITIONS_QUERY_LOWER_BOUND_ONLY,
+            (application_id, since_text, application_id, since_text, application_id, since_text),
+        ).fetchall()
+        return tuple(_row_to_transition_history_row(row) for row in rows)
+
+    def get_transitions_in_window(
+        self, application_id: int, *, window_start: datetime, window_end: datetime
+    ) -> tuple[TransitionHistoryRow, ...]:
+        """Same shape as `list_transitions_for_application`, bounded on
+        both sides -- the evidence assembler's own bounded incident
+        context window (Milestone 11), never "all history since X".
+        """
+
+        start_text = _dt_to_text(window_start)
+        end_text = _dt_to_text(window_end)
+        rows = self._conn.execute(
+            _TRANSITIONS_QUERY_BOTH_BOUNDS,
             (
-                application_id, since_text,
-                application_id, since_text,
-                application_id, since_text,
+                application_id, start_text, end_text,
+                application_id, start_text, end_text,
+                application_id, start_text, end_text,
             ),
         ).fetchall()
         return tuple(_row_to_transition_history_row(row) for row in rows)
+
+    # ---------------------------------------------------------------
+    # Evidence (schema v4, Milestone 10)
+    #
+    # Same discipline as every write method above: this module persists
+    # decisions ``argus.evidence`` already made (which category/severity
+    # a line is, whether a candidate extends an existing signal or starts
+    # a new one, which incidents a signal's window overlaps) -- it never
+    # classifies a log line, never redacts, never decides a bucket
+    # boundary, and never decides which incidents are eligible for
+    # (re-)association. That logic lives in ``argus.evidence.collector``
+    # / ``argus.evidence.association``, mirroring exactly how
+    # ``argus.incidents.engine`` (not this module) owns transition/
+    # incident *decisions* above.
+    # ---------------------------------------------------------------
+
+    def get_log_cursor(self, container_row_id: int) -> datetime | None:
+        """The timestamp of the last log line already read for this
+        container, or ``None`` if evidence collection has never read
+        this container's logs at all."""
+
+        row = self._conn.execute(
+            "SELECT last_log_at FROM log_cursors WHERE container_id = ?", (container_row_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        return _text_to_dt(row["last_log_at"], field_name="log_cursors.last_log_at")
+
+    def set_log_cursor(self, container_row_id: int, *, last_log_at: datetime, updated_at: datetime) -> None:
+        """Advance (or create) this container's log cursor. Never moves
+        it backward -- an out-of-order call cannot rewind how much of
+        the log stream is considered already-read."""
+
+        self._conn.execute(
+            "INSERT INTO log_cursors (container_id, last_log_at, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(container_id) DO UPDATE SET "
+            "last_log_at = MAX(last_log_at, excluded.last_log_at), updated_at = excluded.updated_at",
+            (container_row_id, _dt_to_text(last_log_at), _dt_to_text(updated_at)),
+        )
+
+    def find_latest_log_signal(
+        self, *, container_row_id: int, category: str, normalized_signature: str
+    ) -> EvidenceRecord | None:
+        """The single most-recently-updated ``log_signals`` row for this
+        exact (container, category, signature) key, or ``None`` if none
+        exists yet.
+
+        A plain "most recent row for this key" lookup -- the same shape
+        as ``get_last_transition`` -- with no opinion on whether it is
+        still within its aggregation window; that decision belongs to
+        ``argus.evidence.collector``, which is the caller.
+        """
+
+        row = self._conn.execute(
+            _LOG_SIGNAL_JOIN + " WHERE ls.container_id = ? AND ls.category = ? "
+            "AND ls.normalized_signature = ? ORDER BY ls.last_seen_at DESC LIMIT 1",
+            (container_row_id, category, normalized_signature),
+        ).fetchone()
+        return _row_to_evidence_record(row) if row is not None else None
+
+    def insert_log_signal(
+        self,
+        *,
+        application_id: int,
+        container_row_id: int,
+        category: str,
+        severity: str,
+        normalized_signature: str,
+        first_seen_at: datetime,
+        last_seen_at: datetime,
+        count: int,
+        sample: str,
+        source_type: str,
+        source_ref: str,
+    ) -> int:
+        """Insert one brand-new aggregated signal row."""
+
+        cursor = self._conn.execute(
+            "INSERT INTO log_signals "
+            "(application_id, container_id, category, severity, normalized_signature, "
+            " first_seen_at, last_seen_at, count, sample, source_type, source_ref) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                application_id, container_row_id, category, severity, normalized_signature,
+                _dt_to_text(first_seen_at), _dt_to_text(last_seen_at), count, sample,
+                source_type, source_ref,
+            ),
+        )
+        return cursor.lastrowid
+
+    def extend_log_signal(self, log_signal_id: int, *, last_seen_at: datetime, additional_count: int) -> None:
+        """Extend an existing signal: advance ``last_seen_at`` and add
+        ``additional_count`` to its running ``count``. ``sample`` is
+        deliberately never rewritten -- the first occurrence stays the
+        representative example for this signal's whole lifetime."""
+
+        self._conn.execute(
+            "UPDATE log_signals SET last_seen_at = ?, count = count + ? WHERE id = ?",
+            (_dt_to_text(last_seen_at), additional_count, log_signal_id),
+        )
+
+    def get_log_signal(self, log_signal_id: int) -> EvidenceRecord | None:
+        row = self._conn.execute(
+            _LOG_SIGNAL_JOIN + " WHERE ls.id = ?", (log_signal_id,)
+        ).fetchone()
+        return _row_to_evidence_record(row) if row is not None else None
+
+    def list_log_signals_for_application(
+        self, application_id: int, *, since: datetime
+    ) -> tuple[EvidenceRecord, ...]:
+        """All signals for one application whose ``last_seen_at`` falls at
+        or after ``since``, newest first -- the CLI's own read model
+        (``argus evidence <application>``)."""
+
+        rows = self._conn.execute(
+            _LOG_SIGNAL_JOIN + " WHERE ls.application_id = ? AND ls.last_seen_at >= ? "
+            "ORDER BY ls.last_seen_at DESC",
+            (application_id, _dt_to_text(since)),
+        ).fetchall()
+        return tuple(_row_to_evidence_record(row) for row in rows)
+
+    def list_log_signals_in_window(
+        self, application_id: int, *, window_start: datetime, window_end: datetime
+    ) -> tuple[EvidenceRecord, ...]:
+        """Every signal for one application whose own
+        ``[first_seen_at, last_seen_at]`` span overlaps
+        ``[window_start, window_end]`` -- the overlap test
+        ``argus.evidence.association`` uses to find candidates near an
+        incident's window. Overlap, not containment: a signal that began
+        before ``window_start`` and is still ongoing past it still
+        counts, and vice versa.
+        """
+
+        rows = self._conn.execute(
+            _LOG_SIGNAL_JOIN + " WHERE ls.application_id = ? "
+            "AND ls.first_seen_at <= ? AND ls.last_seen_at >= ? "
+            "ORDER BY ls.first_seen_at ASC",
+            (application_id, _dt_to_text(window_end), _dt_to_text(window_start)),
+        ).fetchall()
+        return tuple(_row_to_evidence_record(row) for row in rows)
+
+    def link_incident_evidence(self, *, incident_id: int, log_signal_id: int, linked_at: datetime) -> None:
+        """Record that ``log_signal_id`` occurred near ``incident_id``'s
+        window. Idempotent: linking an already-linked pair again is a
+        silent no-op (backed by the schema's own
+        ``UNIQUE(incident_id, log_signal_id)``), not an error -- repeated
+        per-tick association scans must be safe to re-run.
+        """
+
+        self._conn.execute(
+            "INSERT OR IGNORE INTO incident_evidence (incident_id, log_signal_id, linked_at) "
+            "VALUES (?, ?, ?)",
+            (incident_id, log_signal_id, _dt_to_text(linked_at)),
+        )
+
+    def list_evidence_for_incident(self, incident_id: int) -> tuple[EvidenceRecord, ...]:
+        rows = self._conn.execute(
+            _LOG_SIGNAL_JOIN.replace("FROM log_signals ls", "FROM incident_evidence ie "
+                                      "JOIN log_signals ls ON ls.id = ie.log_signal_id")
+            + " WHERE ie.incident_id = ? ORDER BY ls.first_seen_at ASC",
+            (incident_id,),
+        ).fetchall()
+        return tuple(_row_to_evidence_record(row) for row in rows)
+
+    def list_incidents_for_association(self, *, grace_cutoff: datetime) -> tuple[IncidentRecord, ...]:
+        """Every incident that is either still open, or was resolved at or
+        after ``grace_cutoff`` -- i.e. every incident whose evidence
+        window (see ``argus.evidence.association``) could still be
+        actively growing. A plain, explicit-parameter filter; the
+        window-semantics *decision* of what ``grace_cutoff`` should be
+        belongs to the caller, not here.
+        """
+
+        rows = self._conn.execute(
+            "SELECT id, scope, scope_id, failure_signature, opened_at, closed_at, status, "
+            "opening_status, worst_status, opening_transition_id, resolving_transition_id "
+            "FROM incidents WHERE status = 'open' OR closed_at >= ? "
+            "ORDER BY opened_at ASC",
+            (_dt_to_text(grace_cutoff),),
+        ).fetchall()
+        return tuple(_row_to_incident_record(row) for row in rows)
+
+    def delete_expired_log_signals(self, *, before: datetime) -> int:
+        """Delete unlinked signals whose ``last_seen_at`` is older than
+        ``before`` -- the retention policy's mechanism. A signal linked
+        to *any* incident (``incident_evidence``) is never deleted here,
+        regardless of age -- an incident's own evidence is retained for
+        as long as the incident itself is (indefinitely, matching
+        Milestone 6's incident history). Returns the number of rows
+        deleted.
+        """
+
+        cursor = self._conn.execute(
+            "DELETE FROM log_signals WHERE last_seen_at < ? "
+            "AND id NOT IN (SELECT log_signal_id FROM incident_evidence)",
+            (_dt_to_text(before),),
+        )
+        return cursor.rowcount
+
+    # ---------------------------------------------------------------
+    # Incident explanations (schema v5, Milestone 12; `provider` added
+    # in schema v6, Milestone 12.1)
+    #
+    # Same discipline as every write method above: this module persists
+    # an already-validated decision (a trusted `IncidentExplanation`)
+    # some other layer already made -- it never calls a model provider,
+    # never validates a response, and never imports `argus.ai` at all.
+    # That logic lives in `argus.ai.explain`/`argus.ai.validation`,
+    # mirroring exactly how `argus.incidents.engine` (not this module)
+    # owns transition/incident *decisions*. `provider` is accepted here
+    # as a plain string (not `argus.ai.providers.AIProviderName`) for
+    # the same reason -- this module has no reason to import that enum.
+    # ---------------------------------------------------------------
+
+    def get_cached_explanation(
+        self, *, incident_id: int, bundle_fingerprint: str, provider: str, model: str, prompt_version: str
+    ) -> ExplanationRecord | None:
+        """The cache lookup: an explanation already exists for this
+        exact (incident, evidence content, provider, model, prompt
+        version) combination, or `None` if a fresh model call is needed.
+        A Gemini and an Anthropic explanation for the same incident and
+        evidence are two different cache entries -- neither is a hit
+        for the other's lookup.
+        """
+
+        row = self._conn.execute(
+            "SELECT id, incident_id, bundle_fingerprint, provider, model, prompt_version, created_at, "
+            "summary, root_cause, confidence, input_tokens, output_tokens, response_json "
+            "FROM incident_explanations "
+            "WHERE incident_id = ? AND bundle_fingerprint = ? AND provider = ? AND model = ? AND prompt_version = ?",
+            (incident_id, bundle_fingerprint, provider, model, prompt_version),
+        ).fetchone()
+        return _row_to_explanation_record(row) if row is not None else None
+
+    def save_explanation(
+        self,
+        *,
+        incident_id: int,
+        bundle_fingerprint: str,
+        provider: str,
+        model: str,
+        prompt_version: str,
+        created_at: datetime,
+        summary: str,
+        root_cause: str | None,
+        confidence: str,
+        input_tokens: int | None,
+        output_tokens: int | None,
+        response_json: str,
+    ) -> int:
+        """Persist one validated explanation. Append-only, like
+        `observations`/`health_transitions` -- a genuinely new
+        `bundle_fingerprint` (evidence changed), `provider`, or
+        `prompt_version` gets its own row; nothing here ever overwrites
+        a prior explanation's history. Raises `DuplicateExplanationError`
+        if the exact same key already exists (the schema's own unique
+        index) -- the cache-lookup-before-call flow in
+        `argus.ai.explain` should always prevent this from being
+        reached in practice.
+        """
+
+        try:
+            cursor = self._conn.execute(
+                "INSERT INTO incident_explanations "
+                "(incident_id, bundle_fingerprint, provider, model, prompt_version, created_at, summary, "
+                " root_cause, confidence, input_tokens, output_tokens, response_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    incident_id, bundle_fingerprint, provider, model, prompt_version, _dt_to_text(created_at),
+                    summary, root_cause, confidence, input_tokens, output_tokens, response_json,
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise DuplicateExplanationError(
+                f"an explanation for incident {incident_id} at fingerprint {bundle_fingerprint!r} "
+                f"(provider={provider!r}, model={model!r}, prompt_version={prompt_version!r}) already exists"
+            ) from exc
+        return cursor.lastrowid
+
+    def list_explanations_for_incident(self, incident_id: int) -> tuple[ExplanationRecord, ...]:
+        """Every explanation ever generated for one incident, from any
+        provider, oldest first -- an audit trail, not just the
+        latest/cached one."""
+
+        rows = self._conn.execute(
+            "SELECT id, incident_id, bundle_fingerprint, provider, model, prompt_version, created_at, "
+            "summary, root_cause, confidence, input_tokens, output_tokens, response_json "
+            "FROM incident_explanations WHERE incident_id = ? ORDER BY created_at ASC, id ASC",
+            (incident_id,),
+        ).fetchall()
+        return tuple(_row_to_explanation_record(row) for row in rows)

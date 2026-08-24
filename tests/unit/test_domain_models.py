@@ -19,11 +19,16 @@ from argus.domain.models import (
     Container,
     DockerHealth,
     DockerState,
+    EVIDENCE_SEVERITY_RANK,
+    EvidenceCategory,
+    EvidenceRecord,
+    EvidenceSeverity,
     HealthStatus,
     Observation,
     PortBinding,
     Protocol,
     Service,
+    evidence_severity_rank,
 )
 
 UTC = timezone.utc
@@ -416,6 +421,132 @@ class TestSerializationRoundTrip:
         assert rebuilt.exit_code is None
         assert rebuilt.finished_at is None
         assert rebuilt.container_ref.compose_project is None
+
+
+# --------------------------------------------------------------------------
+# Evidence -- Milestone 10
+# --------------------------------------------------------------------------
+
+
+def make_evidence(**overrides) -> EvidenceRecord:
+    fields = dict(
+        id=1,
+        application_key="cnstrct",
+        container_id="docker-abc",
+        category=EvidenceCategory.DB_CONNECTION_TIMEOUT,
+        severity=EvidenceSeverity.HIGH,
+        first_seen_at=datetime(2026, 8, 22, 10, 0, 0, tzinfo=UTC),
+        last_seen_at=datetime(2026, 8, 22, 10, 0, 5, tzinfo=UTC),
+        count=3,
+        sample="connection timeout after 30s",
+        source_type="container_log",
+        source_ref="stdout+stderr",
+    )
+    fields.update(overrides)
+    return EvidenceRecord(**fields)
+
+
+class TestEvidenceSeverityRanking:
+    def test_rank_is_explicit_not_declaration_order_or_string_sort(self):
+        assert EVIDENCE_SEVERITY_RANK == {
+            EvidenceSeverity.INFO: 1,
+            EvidenceSeverity.WARNING: 2,
+            EvidenceSeverity.HIGH: 3,
+            EvidenceSeverity.CRITICAL: 4,
+        }
+
+    def test_evidence_severity_rank_function_matches_the_dict(self):
+        for severity, rank in EVIDENCE_SEVERITY_RANK.items():
+            assert evidence_severity_rank(severity) == rank
+
+    def test_critical_outranks_everything_else(self):
+        assert evidence_severity_rank(EvidenceSeverity.CRITICAL) > evidence_severity_rank(EvidenceSeverity.HIGH)
+        assert evidence_severity_rank(EvidenceSeverity.HIGH) > evidence_severity_rank(EvidenceSeverity.WARNING)
+        assert evidence_severity_rank(EvidenceSeverity.WARNING) > evidence_severity_rank(EvidenceSeverity.INFO)
+
+
+class TestEvidenceCategoryEnum:
+    def test_exactly_twelve_categories(self):
+        assert len(EvidenceCategory) == 12
+
+    def test_container_restart_and_unhealthy_are_present(self):
+        assert EvidenceCategory.CONTAINER_RESTART.value == "container_restart"
+        assert EvidenceCategory.CONTAINER_UNHEALTHY.value == "container_unhealthy"
+
+
+class TestEvidenceRecordConstruction:
+    def test_valid_record_constructs(self):
+        evidence = make_evidence()
+        assert evidence.category is EvidenceCategory.DB_CONNECTION_TIMEOUT
+        assert evidence.severity is EvidenceSeverity.HIGH
+
+    def test_string_category_and_severity_are_coerced_to_enum(self):
+        evidence = make_evidence(category="oom", severity="critical")
+        assert evidence.category is EvidenceCategory.OOM
+        assert evidence.severity is EvidenceSeverity.CRITICAL
+
+    def test_id_may_be_none_before_persistence(self):
+        evidence = make_evidence(id=None)
+        assert evidence.id is None
+
+    def test_last_seen_before_first_seen_rejected(self):
+        with pytest.raises(ValueError):
+            make_evidence(
+                first_seen_at=datetime(2026, 8, 22, 10, 0, 5, tzinfo=UTC),
+                last_seen_at=datetime(2026, 8, 22, 10, 0, 0, tzinfo=UTC),
+            )
+
+    def test_naive_datetime_rejected(self):
+        with pytest.raises(ValueError):
+            make_evidence(first_seen_at=datetime(2026, 8, 22, 10, 0, 0))
+
+    def test_zero_count_rejected(self):
+        with pytest.raises(ValueError):
+            make_evidence(count=0)
+
+    def test_negative_count_rejected(self):
+        with pytest.raises(ValueError):
+            make_evidence(count=-1)
+
+    def test_empty_sample_rejected(self):
+        with pytest.raises(ValueError):
+            make_evidence(sample="")
+
+    def test_invalid_source_type_rejected(self):
+        with pytest.raises(ValueError):
+            make_evidence(source_type="something_else")
+
+    def test_empty_application_key_rejected(self):
+        with pytest.raises(ValueError):
+            make_evidence(application_key="")
+
+    def test_empty_container_id_rejected(self):
+        with pytest.raises(ValueError):
+            make_evidence(container_id="")
+
+    def test_unknown_category_string_rejected(self):
+        with pytest.raises(ValueError):
+            make_evidence(category="not_a_real_category")
+
+
+class TestEvidenceRecordSerialization:
+    def test_round_trip_preserves_every_field(self):
+        original = make_evidence()
+        rebuilt = EvidenceRecord.from_dict(original.to_dict())
+        assert rebuilt == original
+
+    def test_to_dict_uses_plain_json_safe_values(self):
+        payload = make_evidence().to_dict()
+        assert payload["category"] == "db_connection_timeout"
+        assert payload["severity"] == "high"
+        assert isinstance(payload["first_seen_at"], str)
+        assert isinstance(payload["count"], int)
+
+    def test_from_dict_with_no_id_key_defaults_to_none(self):
+        payload = make_evidence().to_dict()
+        del payload["id"]
+        rebuilt = EvidenceRecord.from_dict(payload)
+        assert rebuilt.id is None
 
 
 # --------------------------------------------------------------------------

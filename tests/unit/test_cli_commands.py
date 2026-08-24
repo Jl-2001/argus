@@ -17,7 +17,7 @@ from pathlib import Path
 import pytest
 
 from argus.cli import durations, formatting, main as main_module, queries
-from argus.cli.commands import apps, history, incidents, inspect as inspect_cmd, status
+from argus.cli.commands import apps, bundle, evidence, history, incidents, inspect as inspect_cmd, status
 from argus.domain.models import HealthStatus
 from argus.store.database import open_database
 from argus.store.repository import Repository
@@ -69,7 +69,7 @@ class TestHelp:
             main_module.main(["--help"])
         assert exc_info.value.code == 0
         out = capsys.readouterr().out
-        for command in ("status", "apps", "inspect", "incidents", "history"):
+        for command in ("status", "apps", "inspect", "incidents", "history", "evidence", "bundle"):
             assert command in out
 
 
@@ -383,7 +383,9 @@ def _namespace(**kwargs):
 
 FORBIDDEN_IMPORT_ROOTS = {"docker", "anthropic", "openai", "langgraph", "fastapi", "requests", "httpx"}
 
-_CLI_MODULES = (main_module, queries, formatting, durations, status, apps, inspect_cmd, incidents, history)
+_CLI_MODULES = (
+    main_module, queries, formatting, durations, status, apps, inspect_cmd, incidents, history, evidence, bundle,
+)
 
 
 def _imported_roots(source: str) -> set[str]:

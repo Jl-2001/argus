@@ -23,6 +23,7 @@ __all__ = [
     "SchemaError",
     "DuplicateObservationError",
     "DuplicateIncidentError",
+    "DuplicateExplanationError",
     "open_database",
     "open_database_readonly",
     "initialize_database",
@@ -31,7 +32,7 @@ __all__ = [
     "inspect_database_readonly",
 ]
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 6
 
 _SCHEMA_PATH = Path(__file__).resolve().parent / "schema.sql"
 
@@ -51,6 +52,10 @@ REQUIRED_TABLES: tuple[str, ...] = (
     "collector_state",
     "health_transitions",
     "incidents",
+    "log_cursors",
+    "log_signals",
+    "incident_evidence",
+    "incident_explanations",
 )
 
 
@@ -80,6 +85,14 @@ class DuplicateIncidentError(PersistenceError):
     already has one. Application-level dedup logic should always prevent
     this from being reached in practice -- this is the DB-level backstop
     (the schema's partial unique index) firing, not the normal path."""
+
+
+class DuplicateExplanationError(PersistenceError):
+    """A second explanation was attempted for the exact same (incident,
+    bundle_fingerprint, model, prompt_version) key. Milestone 12's own
+    cache-lookup-before-call logic should always prevent this in
+    practice -- this is the DB-level backstop (the schema's own UNIQUE
+    constraint) firing, not the normal path."""
 
 
 def default_database_path(
@@ -183,6 +196,10 @@ def initialize_database(connection: sqlite3.Connection) -> None:
     current_version = connection.execute("PRAGMA user_version").fetchone()[0]
 
     if current_version == 0:
+        # A brand-new database: the script just above already created
+        # `incident_explanations` with `provider` as a real column, so
+        # its indexes are safe to create right now.
+        _create_incident_explanations_indexes(connection)
         connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         return
 
@@ -234,11 +251,130 @@ def _migrate_v2_to_v3(connection: sqlite3.Connection) -> None:
     connection.execute("PRAGMA user_version = 3")
 
 
+def _migrate_v3_to_v4(connection: sqlite3.Connection) -> None:
+    """v3 -> v4 (Milestone 10): adds the evidence tables
+    (``log_cursors``/``log_signals``/``incident_evidence``, already
+    created by the shared schema script) and three new columns on the
+    *pre-existing* ``collector_state`` row -- unlike every migration
+    before it, this one genuinely needs an ``ALTER TABLE``, since
+    ``collector_state`` already exists on a real v3 database with a
+    fixed, narrower column set that ``CREATE TABLE IF NOT EXISTS`` alone
+    cannot widen.
+
+    Guarded by ``PRAGMA table_info`` so this is safe to run even if
+    somehow invoked twice -- consistent with every other part of this
+    module treating schema evolution as idempotent, not "runs exactly
+    once and hopes".
+    """
+
+    existing_columns = {row["name"] for row in connection.execute("PRAGMA table_info(collector_state)")}
+    for column, ddl in (
+        ("last_evidence_success_at", "ALTER TABLE collector_state ADD COLUMN last_evidence_success_at TEXT"),
+        (
+            "consecutive_evidence_failures",
+            "ALTER TABLE collector_state ADD COLUMN consecutive_evidence_failures INTEGER NOT NULL DEFAULT 0",
+        ),
+        ("last_evidence_error", "ALTER TABLE collector_state ADD COLUMN last_evidence_error TEXT"),
+    ):
+        if column not in existing_columns:
+            connection.execute(ddl)
+
+    connection.execute("PRAGMA user_version = 4")
+
+
+def _migrate_v4_to_v5(connection: sqlite3.Connection) -> None:
+    """v4 -> v5 (Milestone 12): adds ``incident_explanations`` (already
+    created by the shared schema script). Purely additive -- no
+    existing table, column, or row is touched. Every v0.1/v0.2 evidence
+    table (observations, health_transitions, incidents, log_signals,
+    incident_evidence, collector_state) is preserved exactly as-is.
+    """
+
+    connection.execute("PRAGMA user_version = 5")
+
+
+def _migrate_v5_to_v6(connection: sqlite3.Connection) -> None:
+    """v5 -> v6 (Milestone 12.1): adds ``incident_explanations.provider``
+    and widens the explanation cache key to include it.
+
+    A genuine v5 database's ``incident_explanations`` table predates
+    ``provider`` entirely and still carries the *old* inline
+    ``UNIQUE(incident_id, bundle_fingerprint, model, prompt_version)``
+    constraint. SQLite backs an inline constraint like that with an
+    unnamed index that is part of the table definition itself -- unlike
+    every earlier migration in this file (which only ever needed to
+    *add* a column or a whole new table), there is no ``ALTER
+    TABLE``/``DROP INDEX`` that can widen or remove it; SQLite itself
+    refuses (``index associated with UNIQUE or PRIMARY KEY constraint
+    cannot be dropped``). The only correct fix is SQLite's own standard
+    table-rebuild procedure: rename the old table aside, let the schema
+    script (already loaded once for this call) recreate
+    ``incident_explanations`` under its real name with the new shape,
+    copy every row across by explicit column name (so a
+    forgotten/reordered column can never silently misalign), then drop
+    the renamed-aside copy.
+
+    Backfilling ``provider = 'anthropic'`` for every pre-existing row is
+    a statement of historical fact, not a guess -- Gemini support did
+    not exist before Milestone 12.1, so every explanation persisted
+    before now was, in fact, generated by Anthropic.
+    """
+
+    existing_columns = {row["name"] for row in connection.execute("PRAGMA table_info(incident_explanations)")}
+    if "provider" in existing_columns:
+        connection.execute("PRAGMA user_version = 6")
+        return
+
+    connection.execute("ALTER TABLE incident_explanations RENAME TO incident_explanations_v5")
+    # Recreates `incident_explanations` under its real name, in the new
+    # (v6) shape -- every other statement in the script is a no-op here
+    # (everything else already exists); this is the one table that
+    # doesn't, since it was just renamed away.
+    connection.executescript(_SCHEMA_PATH.read_text())
+    connection.execute(
+        "INSERT INTO incident_explanations "
+        "(id, incident_id, bundle_fingerprint, provider, model, prompt_version, created_at, "
+        " summary, root_cause, confidence, input_tokens, output_tokens, response_json) "
+        "SELECT id, incident_id, bundle_fingerprint, 'anthropic', model, prompt_version, created_at, "
+        "       summary, root_cause, confidence, input_tokens, output_tokens, response_json "
+        "FROM incident_explanations_v5"
+    )
+    connection.execute("DROP TABLE incident_explanations_v5")
+
+    _create_incident_explanations_indexes(connection)
+    connection.execute("PRAGMA user_version = 6")
+
+
+def _create_incident_explanations_indexes(connection: sqlite3.Connection) -> None:
+    """Creates the two `incident_explanations` indexes that reference
+    `provider` -- split out of `schema.sql`'s own unconditional script
+    because that script must stay safe to run against a database at any
+    prior version, and a genuine pre-Milestone-12.1 table doesn't have
+    this column at the point the script runs (see schema.sql's own
+    comment). Called once for a brand-new database and once from
+    `_migrate_v5_to_v6`, each only after `provider` is guaranteed to
+    exist. Idempotent (`IF NOT EXISTS`), like every other index in this
+    codebase.
+    """
+
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_incident_explanations_cache_key "
+        "ON incident_explanations(incident_id, bundle_fingerprint, provider, model, prompt_version)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS ix_incident_explanations_lookup "
+        "ON incident_explanations(incident_id, bundle_fingerprint, provider, model, prompt_version)"
+    )
+
+
 # Ordered so a database more than one version behind could, in principle,
 # walk forward one step at a time.
 _MIGRATIONS: tuple[_Migration, ...] = (
     _Migration(from_version=1, to_version=2, apply=_migrate_v1_to_v2),
     _Migration(from_version=2, to_version=3, apply=_migrate_v2_to_v3),
+    _Migration(from_version=3, to_version=4, apply=_migrate_v3_to_v4),
+    _Migration(from_version=4, to_version=5, apply=_migrate_v4_to_v5),
+    _Migration(from_version=5, to_version=6, apply=_migrate_v5_to_v6),
 )
 
 

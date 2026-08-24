@@ -28,7 +28,8 @@ from argus.collector.loop import (
 from argus.collectors.docker_client import ContainerAttrs, DockerClient, DockerUnavailableError
 from argus.collectors.docker_collector import discover
 from argus.domain.models import HealthStatus
-from argus.store.database import SchemaError, open_database
+from argus.evidence.collector import EvidenceCollectionLimits
+from argus.store.database import PersistenceError, SchemaError, open_database
 from argus.store.repository import Repository, resolve_observation_health
 
 UTC = timezone.utc
@@ -152,7 +153,7 @@ class TestSchemaMigrationV1ToV2:
         # incidents); a fresh database still gets collector_state along
         # the way, which is the thing this test actually verifies.
         conn = open_database(tmp_path / "a.db")
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 6  # SCHEMA_VERSION moved to 6 in Milestone 12.1 (multi-provider AI)
         tables = {
             row["name"]
             for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
@@ -184,8 +185,8 @@ class TestSchemaMigrationV1ToV2:
         v1_conn.close()
 
         conn = open_database(db_path)
-        # walks v1 -> v2 -> v3 in one open_database() call
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+        # walks v1 -> v2 -> v3 -> v4 in one open_database() call
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 6  # SCHEMA_VERSION moved to 6 in Milestone 12.1 (multi-provider AI)
         tables = {
             row["name"]
             for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
@@ -198,12 +199,13 @@ class TestSchemaMigrationV1ToV2:
         conn.close()
 
     def test_existing_current_version_database_opens_safely(self, tmp_path):
-        # A fresh open_database() now lands directly on v3 (Milestone 6),
+        # A fresh open_database() now lands directly on v4 (Milestone 10),
         # so this exercises "reopening an already-current-version database
         # doesn't lose data" rather than a literal v2 database specifically
-        # -- the genuine v1 -> v3 migration path is covered by the test
-        # above, and v2 -> v3 specifically is covered in
-        # test_incident_engine.py.
+        # -- the genuine v1 -> v4 migration path is covered by the test
+        # above, v2 -> v3 specifically is covered in
+        # test_incident_engine.py, and v3 -> v4 specifically is covered in
+        # test_repository.py's TestSchemaMigrationV3ToV4.
         db_path = tmp_path / "a.db"
         conn = open_database(db_path)
         Repository(conn).upsert_application(
@@ -212,7 +214,7 @@ class TestSchemaMigrationV1ToV2:
         conn.close()
 
         conn2 = open_database(db_path)
-        assert conn2.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert conn2.execute("PRAGMA user_version").fetchone()[0] == 6  # SCHEMA_VERSION moved to 6 in Milestone 12.1 (multi-provider AI)
         assert Repository(conn2).get_application("cnstrct") is not None
         conn2.close()
 
@@ -472,16 +474,33 @@ class TestHistoryProviderWiring:
         # 4 ticks' worth of RestartCount readings: 0, 1, 2, 3 -- a container
         # crash-looping in real time. Delta from the first reading (0) to
         # the last (3) meets the default restart_loop_threshold of 3.
+        #
+        # RestartCount is advanced in `list()`, not `get()` -- `list()` is
+        # called exactly once per tick (discovery's own first call), while
+        # `get()` is now called *twice* per tick since Milestone 10
+        # (once by discovery's inspect_container, once by evidence
+        # collection's get_logs) -- advancing a shared counter in `get()`
+        # would double-advance it per tick.
         restart_counts = iter([0, 1, 2, 3])
+        current_restart_count = {"value": 0}
+
+        class _FakeContainerHandle:
+            def __init__(self, id: str, attrs: dict):
+                self.id = id
+                self.attrs = attrs
+
+            def logs(self, **kwargs):
+                return b""  # no logs -- this test is about restart-loop detection, not evidence
 
         class _CountingContainersAPI:
             def list(self, all=True):
+                current_restart_count["value"] = next(restart_counts)
                 return [SimpleNamespace(id=container_id)]
 
             def get(self, cid):
                 attrs = dict(base_attrs)
-                attrs["RestartCount"] = next(restart_counts)
-                return SimpleNamespace(id=cid, attrs=attrs)
+                attrs["RestartCount"] = current_restart_count["value"]
+                return _FakeContainerHandle(cid, attrs)
 
         class _CountingSDKClient:
             def __init__(self):
@@ -587,6 +606,293 @@ class TestRunForever:
         # tick 1 (the bug) was recorded as a failure; tick 2 succeeded and reset it
         assert repo.get_collector_state().consecutive_failures == 0
         assert sleep.calls == [15.0, 15.0]  # backoff(1)=15 after the bug, then poll_interval after success
+        conn.close()
+
+
+# --------------------------------------------------------------------------
+# Evidence collection integration (Milestone 10)
+# --------------------------------------------------------------------------
+
+
+def _log_ts(dt: datetime) -> str:
+    return dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.000000000Z")
+
+
+class _EvidenceFakeContainer:
+    def __init__(self, id: str, attrs: dict, log_lines: list = (), log_error: BaseException | None = None):
+        self.id = id
+        self.attrs = attrs
+        self._log_lines = list(log_lines)
+        self._log_error = log_error
+        self.logs_calls: list[dict] = []
+
+    def logs(self, **kwargs):
+        self.logs_calls.append(kwargs)
+        if self._log_error is not None:
+            raise self._log_error
+        since = kwargs.get("since")
+        lines = self._log_lines
+        if since is not None:
+            lines = [(dt, text) for dt, text in lines if dt > since]
+        body = "".join(f"{_log_ts(dt)} {text}\n" for dt, text in lines)
+        return body.encode("utf-8")
+
+
+class _EvidenceFakeContainersAPI:
+    def __init__(self, by_id: dict[str, _EvidenceFakeContainer]):
+        self._by_id = by_id
+
+    def list(self, all=True):
+        return [SimpleNamespace(id=cid) for cid in self._by_id]
+
+    def get(self, cid):
+        return self._by_id[cid]
+
+
+class _EvidenceFakeSDKClient:
+    def __init__(self, by_id: dict[str, _EvidenceFakeContainer]):
+        self.containers = _EvidenceFakeContainersAPI(by_id)
+
+
+def make_evidence_client(containers: dict[str, _EvidenceFakeContainer]) -> DockerClient:
+    return DockerClient(client=_EvidenceFakeSDKClient(containers))
+
+
+def _healthy_api_attrs(restart_count: int = 0, health: str = "healthy") -> dict:
+    attrs = dict(load_fixture("compose_healthy_api"))
+    attrs["RestartCount"] = restart_count
+    attrs["State"] = dict(attrs["State"])
+    attrs["State"]["Health"] = dict(attrs["State"]["Health"])
+    attrs["State"]["Health"]["Status"] = health
+    return attrs
+
+
+class TestEvidenceCollectionIntegration:
+    def test_evidence_is_collected_and_persisted_during_a_normal_tick(self, tmp_path):
+        conn, repo = open_repo(tmp_path)
+        container_id = _healthy_api_attrs()["Id"]
+        container = _EvidenceFakeContainer(
+            container_id, _healthy_api_attrs(),
+            log_lines=[
+                (TICK_AT - timedelta(seconds=5), "connection timeout after 30s"),
+                (TICK_AT - timedelta(seconds=4), "connection timeout after 30s"),
+                (TICK_AT - timedelta(seconds=3), "connection timeout after 30s"),
+            ],
+        )
+        client = make_evidence_client({container_id: container})
+        collector = CollectorLoop(client=client, repository=repo, clock=lambda: TICK_AT)
+
+        result = collector.run_once()
+
+        assert result.success is True
+        assert result.evidence_signals_created == 1
+        assert result.evidence_error is None
+
+        app = repo.get_application("cnstrct")
+        signals = repo.list_log_signals_for_application(app.id, since=TICK_AT - timedelta(hours=1))
+        assert len(signals) == 1
+        assert signals[0].category.value == "db_connection_timeout"
+        assert signals[0].count == 3
+        conn.close()
+
+    def test_no_matching_log_lines_still_advances_cursor_and_succeeds(self, tmp_path):
+        conn, repo = open_repo(tmp_path)
+        container_id = _healthy_api_attrs()["Id"]
+        container = _EvidenceFakeContainer(
+            container_id, _healthy_api_attrs(), log_lines=[(TICK_AT - timedelta(seconds=5), "all good")]
+        )
+        client = make_evidence_client({container_id: container})
+        collector = CollectorLoop(client=client, repository=repo, clock=lambda: TICK_AT)
+
+        result = collector.run_once()
+        assert result.success is True
+        assert result.evidence_signals_created == 0
+        assert result.evidence_error is None
+        conn.close()
+
+    def test_cursor_prevents_reingestion_across_ticks(self, tmp_path):
+        conn, repo = open_repo(tmp_path)
+        container_id = _healthy_api_attrs()["Id"]
+        container = _EvidenceFakeContainer(
+            container_id, _healthy_api_attrs(),
+            log_lines=[
+                (TICK_AT - timedelta(seconds=10), "connection timeout"),
+                (TICK_AT - timedelta(seconds=9), "connection timeout"),
+            ],
+        )
+        client = make_evidence_client({container_id: container})
+        clock = make_advancing_clock(TICK_AT, step_seconds=5.0)
+        collector = CollectorLoop(client=client, repository=repo, clock=clock)
+
+        first = collector.run_once()
+        assert first.evidence_signals_created == 1
+        app = repo.get_application("cnstrct")
+        signal = repo.list_log_signals_for_application(app.id, since=TICK_AT - timedelta(hours=1))[0]
+        assert signal.count == 2
+
+        second = collector.run_once()
+        assert second.success is True
+        # no new lines were added between ticks -- the same two lines must
+        # never be re-counted.
+        signal_after = repo.get_log_signal(signal.id)
+        assert signal_after.count == 2
+        conn.close()
+
+    def test_one_containers_log_failure_does_not_affect_another(self, tmp_path):
+        conn, repo = open_repo(tmp_path)
+        healthy = _healthy_api_attrs()
+        broken_attrs = dict(load_fixture("compose_postgres_nohealthcheck"))
+
+        good = _EvidenceFakeContainer(
+            healthy["Id"], healthy, log_lines=[(TICK_AT - timedelta(seconds=5), "connection timeout")]
+        )
+        broken = _EvidenceFakeContainer(
+            broken_attrs["Id"], broken_attrs, log_error=docker.errors.DockerException("log stream broken")
+        )
+        client = make_evidence_client({healthy["Id"]: good, broken_attrs["Id"]: broken})
+        collector = CollectorLoop(client=client, repository=repo, clock=lambda: TICK_AT)
+
+        result = collector.run_once()
+
+        assert result.success is True
+        assert result.evidence_signals_created == 1  # the healthy container's own evidence still persisted
+        assert result.evidence_error is None  # a single container's log failure isn't a subsystem failure
+        conn.close()
+
+    def test_evidence_persistence_failure_does_not_fail_the_core_tick(self, tmp_path, monkeypatch):
+        conn, repo = open_repo(tmp_path)
+        container_id = _healthy_api_attrs()["Id"]
+        container = _EvidenceFakeContainer(
+            container_id, _healthy_api_attrs(),
+            log_lines=[(TICK_AT - timedelta(seconds=5), "connection timeout")],
+        )
+        client = make_evidence_client({container_id: container})
+        collector = CollectorLoop(client=client, repository=repo, clock=lambda: TICK_AT)
+
+        def boom(*args, **kwargs):
+            raise PersistenceError("evidence db write failed")
+
+        monkeypatch.setattr(repo, "insert_log_signal", boom)
+
+        result = collector.run_once()
+
+        assert result.success is True  # core monitoring is unaffected
+        assert result.evidence_signals_created == 0
+        assert result.evidence_error is not None
+        state = repo.get_collector_state()
+        assert state.consecutive_evidence_failures == 1
+        assert state.consecutive_failures == 0  # core heartbeat untouched
+        conn.close()
+
+    def test_docker_fact_evidence_from_restart_count_increase(self, tmp_path):
+        conn, repo = open_repo(tmp_path)
+        container_id = _healthy_api_attrs()["Id"]
+        clock = make_advancing_clock(TICK_AT, step_seconds=5.0)
+
+        client1 = make_evidence_client(
+            {container_id: _EvidenceFakeContainer(container_id, _healthy_api_attrs(restart_count=0))}
+        )
+        collector = CollectorLoop(client=client1, repository=repo, clock=clock)
+        collector.run_once()  # baseline: restart_count=0, no prior observation -> no evidence
+
+        collector._docker_client = make_evidence_client(  # simulate the daemon reporting a real restart
+            {container_id: _EvidenceFakeContainer(container_id, _healthy_api_attrs(restart_count=2))}
+        )
+        result = collector.run_once()
+
+        app = repo.get_application("cnstrct")
+        signals = repo.list_log_signals_for_application(app.id, since=TICK_AT - timedelta(hours=1))
+        restart_signals = [s for s in signals if s.category.value == "container_restart"]
+        assert len(restart_signals) == 1
+        assert restart_signals[0].source_type == "docker_fact"
+        assert result.evidence_signals_created >= 1
+        conn.close()
+
+    def test_docker_fact_evidence_from_unhealthy_docker_health(self, tmp_path):
+        conn, repo = open_repo(tmp_path)
+        container_id = _healthy_api_attrs()["Id"]
+        client = make_evidence_client(
+            {container_id: _EvidenceFakeContainer(container_id, _healthy_api_attrs(health="unhealthy"))}
+        )
+        collector = CollectorLoop(client=client, repository=repo, clock=lambda: TICK_AT)
+        collector.run_once()
+
+        app = repo.get_application("cnstrct")
+        signals = repo.list_log_signals_for_application(app.id, since=TICK_AT - timedelta(hours=1))
+        assert any(s.category.value == "container_unhealthy" for s in signals)
+        conn.close()
+
+    def test_evidence_linked_to_incident_opened_in_the_same_tick(self, tmp_path):
+        conn, repo = open_repo(tmp_path)
+        stopped_attrs = dict(load_fixture("stopped_error"))  # a real STOPPED-shaped fixture
+        container_id = stopped_attrs["Id"]
+        container = _EvidenceFakeContainer(
+            container_id, stopped_attrs,
+            log_lines=[(TICK_AT - timedelta(seconds=5), "connection timeout after 30s")],
+        )
+        client = make_evidence_client({container_id: container})
+        collector = CollectorLoop(client=client, repository=repo, clock=lambda: TICK_AT)
+
+        result = collector.run_once()
+        assert result.success is True
+        assert result.incidents_opened == 1
+        assert result.evidence_associations >= 1
+
+        app_key = next(iter(repo.list_applications())).key
+        app = repo.get_application(app_key)
+        open_incident = repo.get_open_incident(failure_signature=f"application:{app_key}")
+        assert open_incident is not None
+        linked = repo.list_evidence_for_incident(open_incident.id)
+        assert len(linked) >= 1
+        conn.close()
+
+    def test_collect_evidence_false_disables_the_whole_subsystem(self, tmp_path):
+        conn, repo = open_repo(tmp_path)
+        container_id = _healthy_api_attrs()["Id"]
+        container = _EvidenceFakeContainer(
+            container_id, _healthy_api_attrs(),
+            log_lines=[(TICK_AT - timedelta(seconds=5), "connection timeout")],
+        )
+        client = make_evidence_client({container_id: container})
+        config = CollectorConfig(collect_evidence=False)
+        collector = CollectorLoop(client=client, repository=repo, config=config, clock=lambda: TICK_AT)
+
+        result = collector.run_once()
+
+        assert result.success is True
+        assert result.evidence_signals_created == 0
+        assert container.logs_calls == []  # get_logs() was never even called
+        state = repo.get_collector_state()
+        assert state.last_evidence_success_at is None
+        conn.close()
+
+    def test_signals_per_tick_cap_defers_remaining_containers_to_a_later_tick(self, tmp_path):
+        conn, repo = open_repo(tmp_path)
+        healthy = _healthy_api_attrs()
+        postgres_attrs = dict(load_fixture("compose_postgres_nohealthcheck"))
+
+        c1 = _EvidenceFakeContainer(
+            healthy["Id"], healthy, log_lines=[(TICK_AT - timedelta(seconds=5), "connection timeout")]
+        )
+        c2 = _EvidenceFakeContainer(
+            postgres_attrs["Id"], postgres_attrs, log_lines=[(TICK_AT - timedelta(seconds=5), "out of memory")]
+        )
+        client = make_evidence_client({healthy["Id"]: c1, postgres_attrs["Id"]: c2})
+        limits = EvidenceCollectionLimits(max_signals_per_tick=1)
+        config = CollectorConfig(evidence_limits=limits)
+        collector = CollectorLoop(client=client, repository=repo, config=config, clock=lambda: TICK_AT)
+
+        result = collector.run_once()
+
+        assert result.success is True
+        assert result.evidence_signals_created == 1  # capped -- only one container's evidence made it
+        # the un-processed container's cursor must be untouched, so its
+        # evidence is collected (not lost) on a later tick, not skipped
+        # forever.
+        uncapped_container_id = c2.id if c1.logs_calls else c1.id
+        uncapped_row = repo.get_container_by_docker_id(uncapped_container_id)
+        if uncapped_row is not None:
+            assert repo.get_log_cursor(uncapped_row.id) is None
         conn.close()
 
 

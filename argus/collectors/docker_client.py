@@ -11,7 +11,8 @@ automated guard that enforces this.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from datetime import datetime
+from typing import Any, Optional
 
 import docker
 import docker.errors
@@ -110,3 +111,52 @@ class DockerClient:
                 f"could not inspect container {container_id}: {exc}"
             ) from exc
         return ContainerAttrs(id=container.id, attrs=container.attrs)
+
+    def get_logs(
+        self, container_id: str, *, since: Optional[datetime] = None, tail: int = 500
+    ) -> list[str]:
+        """Fetch recent, bounded raw log lines for one container.
+
+        Read-only, same as every other method here: this calls
+        docker-py's ``Container.logs()`` -- the SDK's log-*retrieval*
+        endpoint -- never ``exec_run()`` (``docker exec``), and never
+        shells out to the ``docker`` CLI. It cannot mutate the
+        container it reads from.
+
+        Bounded on two axes: ``tail`` caps the number of lines returned
+        (applied by the Docker daemon itself, not client-side), and
+        ``since`` (when given) excludes anything at or before that
+        timestamp from *Docker's* own filtering. Docker/docker-py may
+        apply ``since`` with only whole-second precision -- callers that
+        need an exact, sub-second dedup boundary (see
+        ``argus.evidence.collector``'s log cursor) must still re-check
+        each returned line's own parsed timestamp themselves; this
+        method does not guarantee ``since`` is applied at
+        microsecond/nanosecond precision, only that it narrows what the
+        daemon returns.
+
+        Each returned line is prefixed with Docker's own RFC3339,
+        nanosecond-precision timestamp (``timestamps=True``) followed by
+        a space -- parsing that prefix is ``argus.evidence.collector``'s
+        job, not this module's; ``DockerClient`` only ever hands back
+        Docker's own bytes, decoded to text.
+        """
+
+        try:
+            container = self._client.containers.get(container_id)
+        except docker.errors.NotFound as exc:
+            raise ContainerVanishedError(container_id) from exc
+        except (docker.errors.DockerException, OSError) as exc:
+            raise DockerUnavailableError(f"could not fetch logs for {container_id}: {exc}") from exc
+
+        kwargs: dict[str, Any] = {"stdout": True, "stderr": True, "timestamps": True, "tail": tail}
+        if since is not None:
+            kwargs["since"] = since
+
+        try:
+            raw = container.logs(**kwargs)
+        except (docker.errors.DockerException, OSError) as exc:
+            raise DockerUnavailableError(f"could not fetch logs for {container_id}: {exc}") from exc
+
+        text = raw.decode("utf-8", errors="replace") if isinstance(raw, (bytes, bytearray)) else str(raw)
+        return text.splitlines()
