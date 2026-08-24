@@ -28,3 +28,4 @@ source .venv/bin/activate
 pip install -e ".[dev]"
 python -m pytest
 ```
+# argus
