@@ -28,4 +28,37 @@ source .venv/bin/activate
 pip install -e ".[dev]"
 python -m pytest
 ```
+
+## API (Milestone 13)
+
+A read-only HTTP API (`argus.api`, built on FastAPI) exposes the same
+deterministic read models and persisted AI explanations the `argus` CLI
+already uses — nothing new is computed here, and nothing here writes
+to the database, mutates a Docker container, or calls an AI provider.
+It exists so a future React dashboard can consume Argus's state without
+duplicating any of that logic.
+
+Start it locally:
+
+```bash
+argus-api
+```
+
+(equivalent to `uvicorn argus.api.app:create_app --factory --host
+127.0.0.1 --port 8088`). It binds to `127.0.0.1` only, never
+`0.0.0.0` — this is not exposed to the network by default. Point it at
+a specific database with `ARGUS_DB_PATH` (same variable the CLI uses).
+
+Once running:
+
+- `http://127.0.0.1:8088/api/v1/...` — every endpoint, versioned,
+  `GET`-only.
+- `http://127.0.0.1:8088/docs` — interactive OpenAPI documentation.
+
+Every `/api/v1` route is provably `GET` only (see
+`tests/unit/test_api_readonly_guard.py`); the one exception to "never
+touches Docker" is `GET /api/v1/system/doctor`, which calls Argus's
+existing read-only `argus doctor` diagnostic subsystem and nothing
+else. There is no React frontend yet — this milestone is the API layer
+only.
 # argus
