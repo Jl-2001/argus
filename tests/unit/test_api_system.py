@@ -81,7 +81,7 @@ class TestDoctorEndpoint:
         names = {check["name"] for check in body["checks"]}
         assert names == {
             "configuration", "database", "docker_connection", "docker_read_access",
-            "collector_heartbeat", "clock",
+            "collector_heartbeat", "remote_agents", "clock",
         }
         db_check = next(c for c in body["checks"] if c["name"] == "database")
         assert db_check["status"] == "FAIL"

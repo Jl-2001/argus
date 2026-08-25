@@ -147,14 +147,14 @@ class TestSchemaBootstrap:
         assert {"applications", "services", "containers", "observations"} <= tables
         conn.close()
 
-    def test_schema_version_is_6(self, tmp_path):
+    def test_schema_version_is_8(self, tmp_path):
         # Was version 1 as of Milestone 4, then 2 as of Milestone 5, then 3
         # as of Milestone 6 (health_transitions/incidents), then 4 as of
         # Milestone 10 (evidence tables), then 5 as of Milestone 12
         # (incident_explanations); Milestone 12.1 bumps it again to add
         # multi-provider support (see TestSchemaMigrationV5ToV6 below).
         conn = open_database(tmp_path / "argus.db")
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 8  # SCHEMA_VERSION moved to 8 in Milestone 16 (multi-host agents)
         conn.close()
 
     def test_wal_enabled_for_file_backed_database(self, tmp_path):
@@ -172,7 +172,7 @@ class TestSchemaBootstrap:
 class TestSchemaMigrationV3ToV4:
     def test_fresh_database_has_evidence_tables_and_columns(self, tmp_path):
         conn = open_database(tmp_path / "a.db")
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 6  # SCHEMA_VERSION moved to 6 in Milestone 12.1 (multi-provider AI)
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 8  # SCHEMA_VERSION moved to 8 in Milestone 16 (multi-host agents)
         tables = {
             row["name"]
             for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
@@ -211,7 +211,7 @@ class TestSchemaMigrationV3ToV4:
         v3_conn.close()
 
         conn = open_database(db_path)
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 6  # SCHEMA_VERSION moved to 6 in Milestone 12.1 (multi-provider AI)
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 8  # SCHEMA_VERSION moved to 8 in Milestone 16 (multi-host agents)
         tables = {
             row["name"]
             for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
@@ -231,7 +231,7 @@ class TestSchemaMigrationV3ToV4:
         conn.close()
 
         conn2 = open_database(db_path)
-        assert conn2.execute("PRAGMA user_version").fetchone()[0] == 6  # SCHEMA_VERSION moved to 6 in Milestone 12.1 (multi-provider AI)
+        assert conn2.execute("PRAGMA user_version").fetchone()[0] == 8  # SCHEMA_VERSION moved to 8 in Milestone 16 (multi-host agents)
         assert Repository(conn2).get_application("cnstrct") is not None
         conn2.close()
 
@@ -288,7 +288,7 @@ class TestSchemaMigrationV3ToV4:
 class TestSchemaMigrationV4ToV5:
     def test_fresh_database_has_incident_explanations_table(self, tmp_path):
         conn = open_database(tmp_path / "a.db")
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 6  # SCHEMA_VERSION moved to 6 in Milestone 12.1 (multi-provider AI)
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 8  # SCHEMA_VERSION moved to 8 in Milestone 16 (multi-host agents)
         tables = {
             row["name"]
             for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
@@ -321,7 +321,7 @@ class TestSchemaMigrationV4ToV5:
         v4_conn.close()
 
         conn = open_database(db_path)
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 6  # SCHEMA_VERSION moved to 6 in Milestone 12.1 (multi-provider AI)
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 8  # SCHEMA_VERSION moved to 8 in Milestone 16 (multi-host agents)
         tables = {
             row["name"]
             for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
@@ -339,7 +339,7 @@ class TestSchemaMigrationV4ToV5:
         conn.close()
 
         conn2 = open_database(db_path)
-        assert conn2.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert conn2.execute("PRAGMA user_version").fetchone()[0] == 8  # SCHEMA_VERSION moved to 8 in Milestone 16 (multi-host agents)
         assert Repository(conn2).get_application("cnstrct") is not None
         conn2.close()
 
@@ -352,7 +352,7 @@ class TestSchemaMigrationV4ToV5:
 class TestSchemaMigrationV5ToV6:
     def test_fresh_database_has_provider_column_and_new_unique_index(self, tmp_path):
         conn = open_database(tmp_path / "a.db")
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 8  # SCHEMA_VERSION moved to 8 in Milestone 16 (multi-host agents)
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(incident_explanations)")}
         assert "provider" in columns
         indexes = {row["name"] for row in conn.execute("PRAGMA index_list(incident_explanations)")}
@@ -417,8 +417,7 @@ class TestSchemaMigrationV5ToV6:
         v5_conn.close()
 
         conn = open_database(db_path)
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 6
-
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 8  # SCHEMA_VERSION moved to 8 in Milestone 16 (multi-host agents)
         row = conn.execute(
             "SELECT incident_id, bundle_fingerprint, provider, model, summary FROM incident_explanations WHERE id = 1"
         ).fetchone()
@@ -499,6 +498,237 @@ class TestSchemaMigrationV5ToV6:
         history = repo.list_explanations_for_incident(1)
         assert {row.provider for row in history} == {"anthropic", "gemini"}
         conn.close()
+
+
+# --------------------------------------------------------------------------
+# Schema migration v7 -> v8 (Milestone 16 -- multi-host agents)
+# --------------------------------------------------------------------------
+
+#: Every column `Repository`/ingestion actually read/write against
+#: `hosts` (see `argus.store.repository._row_to_host_record`,
+#: `Repository.ensure_local_host`, and `Repository.create_agent_host`).
+_EXPECTED_HOST_COLUMNS = {
+    "id",
+    "host_key",
+    "agent_id",
+    "display_name",
+    "kind",
+    "agent_token_hash",
+    "agent_version",
+    "first_seen_at",
+    "last_seen_at",
+}
+
+
+class TestSchemaMigrationV7ToV8:
+    def test_fresh_database_hosts_table_has_every_expected_column(self, tmp_path):
+        """Schema-shape check: a brand-new (never-migrated) database's
+        `hosts` table must carry every column `Repository`/ingestion
+        expect -- independent of the migration path entirely, since a
+        fresh database never runs `_migrate_v7_to_v8` at all (see the
+        `current_version == 0` branch in `initialize_database`)."""
+
+        conn = open_database(tmp_path / "a.db")
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(hosts)")}
+        assert _EXPECTED_HOST_COLUMNS <= columns
+        conn.close()
+
+    def test_migrated_database_hosts_table_has_every_expected_column(self, tmp_path):
+        """Same schema-shape check, but for a database that actually
+        went through `_migrate_v7_to_v8` -- the migration path must
+        converge on exactly the same column set a fresh database gets,
+        not merely "enough columns to not crash on the one INSERT that
+        happened to be tried"."""
+
+        db_path = tmp_path / "a.db"
+        v7_conn = sqlite3.connect(str(db_path))
+        v7_conn.executescript(
+            """
+            CREATE TABLE applications (
+                id INTEGER PRIMARY KEY, key TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
+                is_standalone INTEGER NOT NULL, first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL
+            );
+            """
+        )
+        v7_conn.execute("PRAGMA user_version = 7")
+        v7_conn.commit()
+        v7_conn.close()
+
+        conn = open_database(db_path)
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(hosts)")}
+        assert _EXPECTED_HOST_COLUMNS <= columns
+        conn.close()
+
+    def test_v7_database_with_legacy_hosts_table_missing_agent_id_migrates_successfully(self, tmp_path):
+        """The exact real-world bug: a v7 database whose `hosts` table
+        already exists (e.g. left over from an in-progress build of
+        Milestone 16 that created the table -- and inserted the local
+        host row -- before `agent_id` existed in `schema.sql`) but does
+        NOT have `agent_id` (or the other columns that were added to
+        `hosts` alongside it). `schema.sql`'s own `CREATE TABLE IF NOT
+        EXISTS hosts` is a no-op against this table, so
+        `_migrate_v7_to_v8` must repair its shape itself before
+        `_ensure_local_host` ever tries to INSERT into it -- see
+        `_ensure_hosts_columns`.
+
+        Before the fix, opening a database in exactly this shape raised
+        ``sqlite3.OperationalError: table hosts has no column named
+        agent_id`` from inside `_ensure_local_host`'s INSERT.
+        """
+
+        db_path = tmp_path / "a.db"
+        v7_conn = sqlite3.connect(str(db_path))
+        v7_conn.executescript(
+            """
+            CREATE TABLE applications (
+                id INTEGER PRIMARY KEY, key TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
+                is_standalone INTEGER NOT NULL, first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL
+            );
+            CREATE TABLE services (
+                id INTEGER PRIMARY KEY, application_id INTEGER NOT NULL REFERENCES applications(id),
+                compose_service TEXT, service_key TEXT NOT NULL, name TEXT NOT NULL,
+                first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL,
+                UNIQUE (application_id, service_key)
+            );
+            CREATE TABLE containers (
+                id INTEGER PRIMARY KEY, service_id INTEGER NOT NULL REFERENCES services(id),
+                container_id TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
+                first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL
+            );
+            CREATE TABLE observations (
+                id INTEGER PRIMARY KEY, container_id INTEGER NOT NULL REFERENCES containers(id),
+                observed_at TEXT NOT NULL, docker_state TEXT NOT NULL, docker_health TEXT,
+                restart_count INTEGER NOT NULL, exit_code INTEGER, started_at TEXT, finished_at TEXT,
+                image TEXT NOT NULL, ports_json TEXT NOT NULL, labels_json TEXT NOT NULL,
+                UNIQUE (container_id, observed_at)
+            );
+            -- The legacy hosts table shape: has `host_key`, but predates
+            -- `agent_id`/`agent_token_hash`/`agent_version` entirely --
+            -- the exact shape a partially-built Milestone 16 database
+            -- was left in.
+            CREATE TABLE hosts (
+                id INTEGER PRIMARY KEY,
+                host_key TEXT NOT NULL UNIQUE,
+                display_name TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL
+            );
+            """
+        )
+        v7_conn.execute(
+            "INSERT INTO applications (key, name, is_standalone, first_seen_at, last_seen_at) "
+            "VALUES ('cnstrct','CNSTRCT',0,?,?)",
+            (T1.isoformat(), T1.isoformat()),
+        )
+        v7_conn.execute(
+            "INSERT INTO services (application_id, compose_service, service_key, name, first_seen_at, last_seen_at) "
+            "VALUES (1, 'api', 'api', 'api', ?, ?)",
+            (T1.isoformat(), T1.isoformat()),
+        )
+        v7_conn.execute(
+            "INSERT INTO containers (service_id, container_id, name, first_seen_at, last_seen_at) "
+            "VALUES (1, 'abc123', 'cnstrct-api-1', ?, ?)",
+            (T1.isoformat(), T1.isoformat()),
+        )
+        v7_conn.execute(
+            "INSERT INTO observations (container_id, observed_at, docker_state, restart_count, image, "
+            "ports_json, labels_json) VALUES (1, ?, 'running', 0, 'cnstrct/api:latest', '[]', '{}')",
+            (T1.isoformat(),),
+        )
+        # The pre-existing local host row -- inserted back when `hosts`
+        # had no `agent_id` column at all.
+        v7_conn.execute(
+            "INSERT INTO hosts (host_key, display_name, kind, first_seen_at, last_seen_at) "
+            "VALUES ('local', 'Local Host', 'local', ?, ?)",
+            (T1.isoformat(), T1.isoformat()),
+        )
+        v7_conn.execute("PRAGMA user_version = 7")
+        v7_conn.commit()
+        v7_conn.close()
+
+        # Must not raise -- this is the exact call that raised
+        # `sqlite3.OperationalError` before the fix.
+        conn = open_database(db_path)
+
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 8
+
+        host_columns = {row["name"] for row in conn.execute("PRAGMA table_info(hosts)")}
+        assert _EXPECTED_HOST_COLUMNS <= host_columns
+
+        # Local host backfill: still exactly one 'local' row, its
+        # pre-existing identity (display_name/kind/timestamps) untouched,
+        # `agent_id` present and NULL (never had a value to preserve).
+        host_rows = conn.execute("SELECT * FROM hosts WHERE host_key = 'local'").fetchall()
+        assert len(host_rows) == 1
+        local_host = host_rows[0]
+        assert local_host["agent_id"] is None
+        assert local_host["display_name"] == "Local Host"
+        assert local_host["kind"] == "local"
+
+        # Existing application/service/container/observation history
+        # preserved, and backfilled to the (same) local host.
+        app_row = conn.execute("SELECT * FROM applications WHERE key = 'cnstrct'").fetchone()
+        assert app_row["name"] == "CNSTRCT"
+        assert app_row["host_id"] == local_host["id"]
+
+        container_row = conn.execute("SELECT * FROM containers WHERE container_id = 'abc123'").fetchone()
+        assert container_row["name"] == "cnstrct-api-1"
+        assert container_row["host_id"] == local_host["id"]
+
+        observation_row = conn.execute("SELECT * FROM observations WHERE container_id = 1").fetchone()
+        assert observation_row["docker_state"] == "running"
+
+        # Repository-level read confirms the row is actually usable,
+        # not just structurally present.
+        repo = Repository(conn)
+        record = repo.get_host_by_key("local")
+        assert record is not None
+        assert record.kind == "local"
+        conn.close()
+
+    def test_migration_is_idempotent_on_reopen(self, tmp_path):
+        """Reopening a database already migrated past this bug must not
+        re-raise, re-insert a second local host row, or otherwise
+        misbehave -- consistent with `open_database`'s own documented
+        idempotency guarantee."""
+
+        db_path = tmp_path / "a.db"
+        v7_conn = sqlite3.connect(str(db_path))
+        v7_conn.executescript(
+            """
+            CREATE TABLE applications (
+                id INTEGER PRIMARY KEY, key TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
+                is_standalone INTEGER NOT NULL, first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL
+            );
+            CREATE TABLE hosts (
+                id INTEGER PRIMARY KEY,
+                host_key TEXT NOT NULL UNIQUE,
+                display_name TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL
+            );
+            """
+        )
+        v7_conn.execute(
+            "INSERT INTO hosts (host_key, display_name, kind, first_seen_at, last_seen_at) "
+            "VALUES ('local', 'Local Host', 'local', ?, ?)",
+            (T1.isoformat(), T1.isoformat()),
+        )
+        v7_conn.execute("PRAGMA user_version = 7")
+        v7_conn.commit()
+        v7_conn.close()
+
+        conn = open_database(db_path)
+        conn.close()
+
+        # Reopen -- must not raise, and must not duplicate the local host.
+        conn2 = open_database(db_path)
+        assert conn2.execute("PRAGMA user_version").fetchone()[0] == 8
+        host_rows = conn2.execute("SELECT id FROM hosts WHERE host_key = 'local'").fetchall()
+        assert len(host_rows) == 1
+        conn2.close()
 
 
 # --------------------------------------------------------------------------

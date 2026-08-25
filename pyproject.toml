@@ -23,6 +23,7 @@ dev = ["pytest>=8.0"]
 [project.scripts]
 argus = "argus.cli.main:main"
 argus-api = "argus.api.app:run"
+argus-agent = "argus.agent.app:run"
 
 [tool.setuptools.packages.find]
 include = ["argus*"]

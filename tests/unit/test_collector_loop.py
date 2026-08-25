@@ -153,7 +153,7 @@ class TestSchemaMigrationV1ToV2:
         # incidents); a fresh database still gets collector_state along
         # the way, which is the thing this test actually verifies.
         conn = open_database(tmp_path / "a.db")
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 6  # SCHEMA_VERSION moved to 6 in Milestone 12.1 (multi-provider AI)
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 8  # SCHEMA_VERSION moved to 8 in Milestone 16 (multi-host agents)
         tables = {
             row["name"]
             for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
@@ -186,7 +186,7 @@ class TestSchemaMigrationV1ToV2:
 
         conn = open_database(db_path)
         # walks v1 -> v2 -> v3 -> v4 in one open_database() call
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 6  # SCHEMA_VERSION moved to 6 in Milestone 12.1 (multi-provider AI)
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 8  # SCHEMA_VERSION moved to 8 in Milestone 16 (multi-host agents)
         tables = {
             row["name"]
             for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
@@ -214,7 +214,7 @@ class TestSchemaMigrationV1ToV2:
         conn.close()
 
         conn2 = open_database(db_path)
-        assert conn2.execute("PRAGMA user_version").fetchone()[0] == 6  # SCHEMA_VERSION moved to 6 in Milestone 12.1 (multi-provider AI)
+        assert conn2.execute("PRAGMA user_version").fetchone()[0] == 8  # SCHEMA_VERSION moved to 8 in Milestone 16 (multi-host agents)
         assert Repository(conn2).get_application("cnstrct") is not None
         conn2.close()
 
@@ -450,6 +450,147 @@ class TestRunOnce:
 
     def test_missing_evaluation_error_is_the_documented_type(self):
         assert issubclass(MissingEvaluationError, RuntimeError)
+
+
+# --------------------------------------------------------------------------
+# Milestone 15 -- realtime event emission from a real tick, and the one
+# guarantee that matters most: a broken realtime_events write must never
+# roll back (or even affect) core monitoring state.
+# --------------------------------------------------------------------------
+
+
+class TestRealtimeEventEmission:
+    def test_successful_tick_emits_a_collector_tick_event(self, tmp_path):
+        conn, repo = open_repo(tmp_path)
+        client = make_fixture_client(["compose_healthy_api"])
+        collector = CollectorLoop(client=client, repository=repo, clock=lambda: TICK_AT)
+
+        result = collector.run_once()
+        assert result.success is True
+
+        events = repo.list_realtime_events_since(after_id=0)
+        tick_events = [e for e in events if e.event_type == "collector.tick"]
+        assert len(tick_events) == 1
+        payload = json.loads(tick_events[0].payload_json)
+        assert payload["success"] is True
+        conn.close()
+
+    def test_a_new_application_emits_an_application_status_changed_event(self, tmp_path):
+        conn, repo = open_repo(tmp_path)
+        client = make_fixture_client(["compose_healthy_api"])
+        collector = CollectorLoop(client=client, repository=repo, clock=lambda: TICK_AT)
+
+        collector.run_once()
+
+        events = repo.list_realtime_events_since(after_id=0)
+        app_events = [e for e in events if e.event_type == "application.status_changed"]
+        assert len(app_events) == 1
+        payload = json.loads(app_events[0].payload_json)
+        assert payload["application_key"] == "cnstrct"
+        assert payload["to_status"] == "HEALTHY"
+        conn.close()
+
+    def test_realtime_event_write_failure_never_rolls_back_core_tick_state(self, tmp_path, monkeypatch):
+        """The whole point of argus.realtime.emitter's own failure
+        isolation, proven here from the collector loop's own point of
+        view: even if *every* realtime_events write raises, the tick
+        must still succeed, observations/transitions/incidents must
+        still persist, and collector_state must still advance -- exactly
+        as if the realtime layer didn't exist at all.
+        """
+
+        conn, repo = open_repo(tmp_path)
+        client = make_fixture_client(["compose_healthy_api"])
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("simulated realtime_events write failure (e.g. disk full)")
+
+        monkeypatch.setattr(Repository, "insert_realtime_event", _boom)
+
+        collector = CollectorLoop(client=client, repository=repo, clock=lambda: TICK_AT)
+        result = collector.run_once()
+
+        assert result.success is True
+        assert result.applications == 1
+        assert result.error is None
+
+        app = repo.get_application("cnstrct")
+        assert app is not None
+        state = repo.get_collector_state()
+        assert state.last_success_at == TICK_AT
+        assert state.consecutive_failures == 0
+
+        # And -- since every insert attempt raised -- genuinely no
+        # realtime_events rows exist; the failure was fully isolated,
+        # not silently half-applied.
+        assert repo.list_realtime_events_since(after_id=0) == ()
+        conn.close()
+
+
+# --------------------------------------------------------------------------
+# Host wiring (Milestone 16)
+# --------------------------------------------------------------------------
+
+
+class TestHostWiring:
+    def test_local_applications_are_persisted_under_the_local_host(self, tmp_path):
+        conn, repo = open_repo(tmp_path)
+        client = make_fixture_client(["compose_healthy_api"])
+        collector = CollectorLoop(client=client, repository=repo, clock=lambda: TICK_AT)
+
+        collector.run_once()
+
+        app = repo.get_application("cnstrct")
+        local_host = repo.get_host_by_key("local")
+        assert app.host_id == local_host.id
+        conn.close()
+
+    def test_application_key_is_unscoped_for_the_local_host(self, tmp_path):
+        conn, repo = open_repo(tmp_path)
+        client = make_fixture_client(["compose_healthy_api"])
+        collector = CollectorLoop(client=client, repository=repo, clock=lambda: TICK_AT)
+
+        collector.run_once()
+
+        # Byte-for-byte the same key a pre-Milestone-16 single-host
+        # installation always used -- no "local:" prefix anywhere.
+        assert repo.get_application("cnstrct") is not None
+        conn.close()
+
+    def test_custom_host_display_name_is_applied(self, tmp_path):
+        conn, repo = open_repo(tmp_path)
+        client = make_fixture_client(["compose_healthy_api"])
+        collector = CollectorLoop(
+            client=client, repository=repo, clock=lambda: TICK_AT, host_display_name="MacBook"
+        )
+
+        collector.run_once()
+
+        local_host = repo.get_host_by_key("local")
+        assert local_host.display_name == "MacBook"
+        conn.close()
+
+    def test_local_host_heartbeat_advances_on_every_tick(self, tmp_path):
+        conn, repo = open_repo(tmp_path)
+        client = make_fixture_client(["compose_healthy_api"])
+        # `record_host_heartbeat` only ever advances `last_seen_at`
+        # (MAX) -- must start from the real wall clock, not the fixed
+        # historical `TICK_AT`, since the local host row's own
+        # `first_seen_at`/`last_seen_at` was itself bootstrapped from
+        # the *real* current time by `open_repo`'s underlying
+        # `open_database` call a moment ago, which would otherwise
+        # already be later than `TICK_AT` and silently swallow every
+        # comparison in this test.
+        clock = make_advancing_clock(datetime.now(UTC))
+        collector = CollectorLoop(client=client, repository=repo, clock=clock)
+
+        collector.run_once()
+        first_seen = repo.get_host_by_key("local").last_seen_at
+        collector.run_once()
+        second_seen = repo.get_host_by_key("local").last_seen_at
+
+        assert second_seen > first_seen
+        conn.close()
 
 
 # --------------------------------------------------------------------------

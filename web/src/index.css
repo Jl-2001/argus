@@ -1,0 +1,136 @@
+@import "tailwindcss";
+
+/* Class-based dark mode: `.dark` on <html>, toggled by
+   src/hooks/useTheme.ts. Falls back to system preference only for the
+   very first paint (see that hook). */
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "Cascadia Code", Consolas, monospace;
+}
+
+:root {
+  /* Restrained, professional operations-tool palette -- not a
+     marketing/CRUD-admin theme. Every color below is referenced as a
+     Tailwind utility via the `bg-background`/`text-foreground`/etc.
+     mapping in @theme inline below. */
+  --background: oklch(0.99 0 0);
+  --foreground: oklch(0.16 0.01 260);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.16 0.01 260);
+  --border: oklch(0.9 0.005 260);
+  --input: oklch(0.9 0.005 260);
+  --ring: oklch(0.55 0.14 260);
+
+  --muted: oklch(0.96 0.005 260);
+  --muted-foreground: oklch(0.48 0.01 260);
+
+  --primary: oklch(0.4 0.14 260);
+  --primary-foreground: oklch(0.98 0 0);
+  --secondary: oklch(0.95 0.005 260);
+  --secondary-foreground: oklch(0.2 0.01 260);
+  --accent: oklch(0.95 0.005 260);
+  --accent-foreground: oklch(0.2 0.01 260);
+
+  --destructive: oklch(0.55 0.22 25);
+  --destructive-foreground: oklch(0.98 0 0);
+
+  /* Health/status colors -- the single source of truth every
+     status-badge component maps through (see src/lib/status.ts). */
+  --status-healthy: oklch(0.6 0.15 155);
+  --status-degraded: oklch(0.75 0.16 80);
+  --status-unhealthy: oklch(0.58 0.22 25);
+  --status-stopped: oklch(0.55 0.01 260);
+  --status-restarting: oklch(0.6 0.14 250);
+  --status-unknown: oklch(0.65 0.01 260);
+
+  --severity-info: oklch(0.6 0.05 250);
+  --severity-warning: oklch(0.75 0.16 80);
+  --severity-high: oklch(0.65 0.2 45);
+  --severity-critical: oklch(0.55 0.22 25);
+}
+
+.dark {
+  --background: oklch(0.16 0.01 260);
+  --foreground: oklch(0.95 0.005 260);
+  --card: oklch(0.2 0.01 260);
+  --card-foreground: oklch(0.95 0.005 260);
+  --border: oklch(0.3 0.01 260);
+  --input: oklch(0.3 0.01 260);
+  --ring: oklch(0.65 0.14 260);
+
+  --muted: oklch(0.24 0.01 260);
+  --muted-foreground: oklch(0.65 0.01 260);
+
+  --primary: oklch(0.75 0.13 260);
+  --primary-foreground: oklch(0.16 0.01 260);
+  --secondary: oklch(0.26 0.01 260);
+  --secondary-foreground: oklch(0.95 0.005 260);
+  --accent: oklch(0.26 0.01 260);
+  --accent-foreground: oklch(0.95 0.005 260);
+
+  --destructive: oklch(0.65 0.2 25);
+  --destructive-foreground: oklch(0.98 0 0);
+
+  --status-healthy: oklch(0.7 0.16 155);
+  --status-degraded: oklch(0.78 0.15 85);
+  --status-unhealthy: oklch(0.68 0.2 25);
+  --status-stopped: oklch(0.6 0.01 260);
+  --status-restarting: oklch(0.7 0.13 250);
+  --status-unknown: oklch(0.6 0.01 260);
+
+  --severity-info: oklch(0.65 0.06 250);
+  --severity-warning: oklch(0.78 0.15 85);
+  --severity-high: oklch(0.7 0.18 45);
+  --severity-critical: oklch(0.68 0.2 25);
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+
+  --color-status-healthy: var(--status-healthy);
+  --color-status-degraded: var(--status-degraded);
+  --color-status-unhealthy: var(--status-unhealthy);
+  --color-status-stopped: var(--status-stopped);
+  --color-status-restarting: var(--status-restarting);
+  --color-status-unknown: var(--status-unknown);
+
+  --color-severity-info: var(--severity-info);
+  --color-severity-warning: var(--severity-warning);
+  --color-severity-high: var(--severity-high);
+  --color-severity-critical: var(--severity-critical);
+}
+
+@layer base {
+  * {
+    border-color: var(--color-border);
+  }
+  body {
+    background-color: var(--color-background);
+    color: var(--color-foreground);
+    font-family: var(--font-sans);
+  }
+  /* Visible focus states everywhere, not just form controls -- see
+     the milestone's own Accessibility section. */
+  :focus-visible {
+    outline: 2px solid var(--color-ring);
+    outline-offset: 2px;
+  }
+}

@@ -26,6 +26,7 @@ _DISPLAY_NAMES: dict[str, str] = {
     "docker_connection": "Docker connection",
     "docker_read_access": "Docker read access",
     "collector_heartbeat": "Collector heartbeat",
+    "remote_agents": "Remote agents",
     "clock": "Clock",
 }
 

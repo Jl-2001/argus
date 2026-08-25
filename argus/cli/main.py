@@ -23,13 +23,13 @@ import sys
 from datetime import datetime, timezone
 from typing import Optional, Sequence
 
-from argus.cli.commands import apps, bundle, doctor, evidence, explain, history, incidents, inspect as inspect_cmd, status
+from argus.cli.commands import agents, apps, bundle, doctor, evidence, explain, history, incidents, inspect as inspect_cmd, status
 from argus.store.database import DatabaseOpenError, SchemaError, default_database_path, open_database
 from argus.store.repository import Repository
 
 __all__ = ["build_parser", "main"]
 
-_COMMAND_MODULES = (status, apps, inspect_cmd, incidents, history, evidence, bundle, explain, doctor)
+_COMMAND_MODULES = (status, apps, inspect_cmd, incidents, history, evidence, bundle, explain, agents, doctor)
 
 
 def build_parser() -> argparse.ArgumentParser:

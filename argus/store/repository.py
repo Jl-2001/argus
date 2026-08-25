@@ -23,8 +23,9 @@ import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Mapping, Sequence
+from typing import Mapping, Optional, Sequence
 
+from argus.domain.host import LOCAL_HOST_KEY
 from argus.domain.models import (
     Application,
     Container,
@@ -60,6 +61,8 @@ __all__ = [
     "IncidentEvidenceRecord",
     "ObservationRecord",
     "ExplanationRecord",
+    "RealtimeEventRecord",
+    "HostRecord",
     "Repository",
     "resolve_observation_health",
 ]
@@ -139,6 +142,35 @@ class ApplicationRecord:
     key: str
     name: str
     is_standalone: bool
+    first_seen_at: datetime
+    last_seen_at: datetime
+    #: Milestone 16. ``None`` only for a row written by a caller that
+    #: never supplied one (pre-Milestone-16-style direct
+    #: ``upsert_application``/``persist_discovery`` calls, still valid
+    #: against the nullable FK) -- every real production write
+    #: (``argus.collector.loop``, ``argus.api.routes.agents``) always
+    #: resolves and passes a real host id first (see
+    #: ``Repository.ensure_local_host``).
+    host_id: Optional[int] = None
+
+
+@dataclass(frozen=True, slots=True)
+class HostRecord:
+    """One row of ``hosts`` (Milestone 16). ``agent_token_hash`` is
+    carried here (this module has no reason to hide it from itself --
+    it's needed for the ingestion route's own auth check) but is never
+    the kind of thing a caller should serialize into an API response or
+    a CLI print statement; see ``argus.api.models``'s host response
+    shapes, which deliberately never include it.
+    """
+
+    id: int
+    host_key: str
+    agent_id: str | None
+    display_name: str
+    kind: str  # "local" | "agent"
+    agent_token_hash: str | None
+    agent_version: str | None
     first_seen_at: datetime
     last_seen_at: datetime
 
@@ -231,7 +263,14 @@ class IncidentRecord:
 class ApplicationCountsRecord:
     """One row of `list_applications_with_counts()` -- identity plus how
     many services/containers currently belong to it, in one query rather
-    than one round trip per application."""
+    than one round trip per application.
+
+    ``host_key``/``host_display_name`` (Milestone 16) come along for
+    free via the same query's own join onto ``hosts`` -- callers that
+    want to show "which machine is this on" (the CLI's `argus apps`,
+    the dashboard's Applications page) never need a second round trip
+    per application to get it.
+    """
 
     id: int
     key: str
@@ -240,6 +279,8 @@ class ApplicationCountsRecord:
     last_seen_at: datetime
     service_count: int
     container_count: int
+    host_key: str = LOCAL_HOST_KEY
+    host_display_name: str = "Local Host"
 
 
 @dataclass(frozen=True, slots=True)
@@ -338,6 +379,21 @@ class ExplanationRecord:
     response_json: str
 
 
+@dataclass(frozen=True, slots=True)
+class RealtimeEventRecord:
+    """One row of ``realtime_events`` (Milestone 15). ``payload_json`` is
+    already-serialized JSON text this module never parses or validates
+    -- see ``argus.realtime.emitter`` for what it actually contains
+    (always a small, sanitized set of ids/keys/statuses/timestamps/
+    counts, never a raw log sample or secret)."""
+
+    id: int
+    event_type: str
+    occurred_at: datetime
+    payload_json: str
+    created_at: datetime
+
+
 def _row_to_application_record(row: sqlite3.Row) -> ApplicationRecord:
     return ApplicationRecord(
         id=row["id"],
@@ -346,6 +402,21 @@ def _row_to_application_record(row: sqlite3.Row) -> ApplicationRecord:
         is_standalone=bool(row["is_standalone"]),
         first_seen_at=_text_to_dt(row["first_seen_at"], field_name="applications.first_seen_at"),
         last_seen_at=_text_to_dt(row["last_seen_at"], field_name="applications.last_seen_at"),
+        host_id=row["host_id"],
+    )
+
+
+def _row_to_host_record(row: sqlite3.Row) -> HostRecord:
+    return HostRecord(
+        id=row["id"],
+        host_key=row["host_key"],
+        agent_id=row["agent_id"],
+        display_name=row["display_name"],
+        kind=row["kind"],
+        agent_token_hash=row["agent_token_hash"],
+        agent_version=row["agent_version"],
+        first_seen_at=_text_to_dt(row["first_seen_at"], field_name="hosts.first_seen_at"),
+        last_seen_at=_text_to_dt(row["last_seen_at"], field_name="hosts.last_seen_at"),
     )
 
 
@@ -422,6 +493,7 @@ def _row_to_incident_record(row: sqlite3.Row) -> IncidentRecord:
 
 
 def _row_to_application_counts_record(row: sqlite3.Row) -> ApplicationCountsRecord:
+    row_keys = row.keys()
     return ApplicationCountsRecord(
         id=row["id"],
         key=row["key"],
@@ -430,6 +502,17 @@ def _row_to_application_counts_record(row: sqlite3.Row) -> ApplicationCountsReco
         last_seen_at=_text_to_dt(row["last_seen_at"], field_name="applications.last_seen_at"),
         service_count=row["service_count"],
         container_count=row["container_count"],
+        # LEFT JOIN hosts -- a row whose application has no host_id yet
+        # (written by a pre-Milestone-16-style caller with no host
+        # concept) falls back to the same local-host labels the
+        # dataclass field itself defaults to, rather than surfacing a
+        # raw ``None``.
+        host_key=row["host_key"] if "host_key" in row_keys and row["host_key"] is not None else LOCAL_HOST_KEY,
+        host_display_name=(
+            row["host_display_name"]
+            if "host_display_name" in row_keys and row["host_display_name"] is not None
+            else "Local Host"
+        ),
     )
 
 
@@ -500,6 +583,16 @@ def _row_to_explanation_record(row: sqlite3.Row) -> ExplanationRecord:
         input_tokens=row["input_tokens"],
         output_tokens=row["output_tokens"],
         response_json=row["response_json"],
+    )
+
+
+def _row_to_realtime_event_record(row: sqlite3.Row) -> RealtimeEventRecord:
+    return RealtimeEventRecord(
+        id=row["id"],
+        event_type=row["event_type"],
+        occurred_at=_text_to_dt(row["occurred_at"], field_name="realtime_events.occurred_at"),
+        payload_json=row["payload_json"],
+        created_at=_text_to_dt(row["created_at"], field_name="realtime_events.created_at"),
     )
 
 
@@ -750,7 +843,7 @@ class Repository:
     # ---------------------------------------------------------------
 
     def upsert_application(
-        self, *, key: str, name: str, is_standalone: bool, observed_at: datetime
+        self, *, key: str, name: str, is_standalone: bool, observed_at: datetime, host_id: Optional[int] = None
     ) -> int:
         """Insert or refresh an application identity row.
 
@@ -759,6 +852,14 @@ class Repository:
         ``MAX`` comparison) -- an out-of-order call can't rewind it.
         ``name``/``is_standalone`` are treated as current metadata and
         always updated to the latest supplied value.
+
+        ``host_id`` (Milestone 16) is written once, at insert, and never
+        updated afterward -- an application's owning host is part of its
+        identity, not current metadata; ``key`` itself is already
+        host-scoped by the time it reaches here (see
+        ``argus.domain.host.scope_application_key``), so a mismatched
+        ``host_id`` on an update would only ever indicate a caller bug,
+        never a legitimate host migration this method needs to handle.
         """
 
         observed_at_text = _dt_to_text(observed_at)
@@ -768,9 +869,9 @@ class Repository:
 
         if existing is None:
             cursor = self._conn.execute(
-                "INSERT INTO applications (key, name, is_standalone, first_seen_at, last_seen_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (key, name, int(is_standalone), observed_at_text, observed_at_text),
+                "INSERT INTO applications (key, name, is_standalone, first_seen_at, last_seen_at, host_id) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (key, name, int(is_standalone), observed_at_text, observed_at_text, host_id),
             )
             return cursor.lastrowid
 
@@ -827,6 +928,7 @@ class Repository:
         name: str,
         first_seen_at: datetime,
         last_seen_at: datetime,
+        host_id: Optional[int] = None,
     ) -> int:
         """Insert or refresh a container identity row.
 
@@ -838,7 +940,9 @@ class Repository:
 
         A ``name`` change for the *same* ``container_id`` updates the
         current display name -- name is current metadata, not part of
-        the container's historical identity.
+        the container's historical identity. ``host_id`` (Milestone 16)
+        is written once, at insert, for the same reason it is on
+        ``upsert_application`` -- see that method's own docstring.
         """
 
         existing = self._conn.execute(
@@ -848,9 +952,12 @@ class Repository:
         if existing is None:
             cursor = self._conn.execute(
                 "INSERT INTO containers "
-                "(service_id, container_id, name, first_seen_at, last_seen_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (service_id, container_id, name, _dt_to_text(first_seen_at), _dt_to_text(last_seen_at)),
+                "(service_id, container_id, name, first_seen_at, last_seen_at, host_id) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    service_id, container_id, name,
+                    _dt_to_text(first_seen_at), _dt_to_text(last_seen_at), host_id,
+                ),
             )
             return cursor.lastrowid
 
@@ -860,6 +967,125 @@ class Repository:
             (service_id, name, _dt_to_text(last_seen_at), existing["id"]),
         )
         return existing["id"]
+
+    # ---------------------------------------------------------------
+    # Host identity -- Milestone 16
+    # ---------------------------------------------------------------
+
+    def ensure_local_host(self, *, display_name: str, now: datetime) -> int:
+        """Idempotent: returns the local host's row id, creating it if
+        it somehow doesn't exist yet (a fresh/migrated database already
+        has one -- see ``argus.store.database._ensure_local_host`` --
+        so this is normally just a lookup). ``display_name`` updates the
+        existing row's label every time this is called (e.g. a
+        ``CollectorLoop`` reading a fresh ``ARGUS_HOST_NAME`` on
+        restart) -- this is current metadata, not part of a host's
+        identity, matching the same discipline ``upsert_application``
+        already applies to ``name``.
+        """
+
+        existing = self._conn.execute(
+            "SELECT id FROM hosts WHERE host_key = ?", (LOCAL_HOST_KEY,)
+        ).fetchone()
+        now_text = _dt_to_text(now)
+        if existing is not None:
+            self._conn.execute("UPDATE hosts SET display_name = ? WHERE id = ?", (display_name, existing["id"]))
+            return existing["id"]
+
+        cursor = self._conn.execute(
+            "INSERT INTO hosts (host_key, agent_id, display_name, kind, agent_token_hash, agent_version, "
+            "first_seen_at, last_seen_at) VALUES (?, NULL, ?, 'local', NULL, NULL, ?, ?)",
+            (LOCAL_HOST_KEY, display_name, now_text, now_text),
+        )
+        return cursor.lastrowid
+
+    def create_agent_host(
+        self, *, host_key: str, agent_id: str, display_name: str, token_hash: str, now: datetime
+    ) -> int:
+        """Administrative registration of a new remote agent host (`argus
+        agents add`) -- never called from any request-handling path.
+
+        ``agent_id`` is the credential identity a bearer token is
+        actually verified against (see schema.sql's own comment on
+        ``hosts.agent_id`` for why it is deliberately a separate column
+        from ``host_key``) -- generated by the caller (see
+        ``argus.cli.commands.agents``), never derived from ``host_key``
+        itself. ``token_hash`` is always an already-hashed credential
+        (see ``argus.security.hash_token``); this method never sees, and
+        this table never stores, the plaintext token. Raises
+        ``PersistenceError`` if ``host_key`` (or ``agent_id``) is
+        already registered (deliberately not idempotent, unlike
+        ``ensure_local_host`` -- re-running this command for an existing
+        host would silently issue a second, different token a caller
+        might think is the first one still in effect).
+        """
+
+        now_text = _dt_to_text(now)
+        try:
+            cursor = self._conn.execute(
+                "INSERT INTO hosts (host_key, agent_id, display_name, kind, agent_token_hash, agent_version, "
+                "first_seen_at, last_seen_at) VALUES (?, ?, ?, 'agent', ?, NULL, ?, ?)",
+                (host_key, agent_id, display_name, token_hash, now_text, now_text),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise PersistenceError(f"a host with host_key {host_key!r} is already registered") from exc
+        return cursor.lastrowid
+
+    def get_host_by_key(self, host_key: str) -> HostRecord | None:
+        row = self._conn.execute(
+            "SELECT id, host_key, agent_id, display_name, kind, agent_token_hash, agent_version, "
+            "first_seen_at, last_seen_at FROM hosts WHERE host_key = ?",
+            (host_key,),
+        ).fetchone()
+        return _row_to_host_record(row) if row is not None else None
+
+    def get_host_by_id(self, host_id: int) -> HostRecord | None:
+        row = self._conn.execute(
+            "SELECT id, host_key, agent_id, display_name, kind, agent_token_hash, agent_version, "
+            "first_seen_at, last_seen_at FROM hosts WHERE id = ?",
+            (host_id,),
+        ).fetchone()
+        return _row_to_host_record(row) if row is not None else None
+
+    def get_host_by_agent_id(self, agent_id: str) -> HostRecord | None:
+        """The one lookup ``argus.api.routes.agents`` uses to authenticate
+        an ingest request -- by the request's claimed ``agent_id``, never
+        by its (separately, and only afterward, checked) ``host_key``.
+        See schema.sql's own comment on ``hosts.agent_id``."""
+
+        row = self._conn.execute(
+            "SELECT id, host_key, agent_id, display_name, kind, agent_token_hash, agent_version, "
+            "first_seen_at, last_seen_at FROM hosts WHERE agent_id = ?",
+            (agent_id,),
+        ).fetchone()
+        return _row_to_host_record(row) if row is not None else None
+
+    def list_hosts(self) -> tuple[HostRecord, ...]:
+        rows = self._conn.execute(
+            "SELECT id, host_key, agent_id, display_name, kind, agent_token_hash, agent_version, "
+            "first_seen_at, last_seen_at FROM hosts ORDER BY host_key"
+        ).fetchall()
+        return tuple(_row_to_host_record(row) for row in rows)
+
+    def record_host_heartbeat(self, *, host_id: int, at: datetime, agent_version: str | None = None) -> None:
+        """Every valid tick (local) / authenticated ingest (agent)
+        advances ``last_seen_at`` -- the one fact
+        ``argus.domain.host.evaluate_host_status`` needs. ``last_seen_at``
+        only ever advances (``MAX``), same discipline as every other
+        ``last_seen_at`` in this module. ``agent_version`` is only
+        overwritten when supplied (an agent reports its own version on
+        every ingest; the local host has none)."""
+
+        at_text = _dt_to_text(at)
+        if agent_version is not None:
+            self._conn.execute(
+                "UPDATE hosts SET last_seen_at = MAX(last_seen_at, ?), agent_version = ? WHERE id = ?",
+                (at_text, agent_version, host_id),
+            )
+        else:
+            self._conn.execute(
+                "UPDATE hosts SET last_seen_at = MAX(last_seen_at, ?) WHERE id = ?", (at_text, host_id)
+            )
 
     # ---------------------------------------------------------------
     # Observation write
@@ -917,6 +1143,7 @@ class Repository:
         *,
         applications: Sequence[Application],
         observations: Sequence[Observation],
+        host_id: Optional[int] = None,
     ) -> PersistDiscoveryReport:
         """Persist one complete discovery snapshot in a single transaction.
 
@@ -925,6 +1152,22 @@ class Repository:
         through (including a duplicate observation) rolls the whole
         snapshot back rather than leaving a half-written application
         behind.
+
+        ``host_id`` (Milestone 16) identifies which monitored machine
+        this whole snapshot came from -- every application/container row
+        this call writes or refreshes is stamped with it. ``applications``
+        (and each of their services) must already carry
+        host-*scoped* keys by the time they reach this method (see
+        ``argus.domain.host.scope_application_key`` and
+        ``argus.ingestion.pipeline``, the one place that scoping is
+        applied) -- this method itself has no idea what a host is beyond
+        the plain integer id it's given. Defaults to ``None`` (stored as
+        SQL ``NULL``, valid against the nullable FK) purely so this
+        module's own pre-Milestone-16 test suite -- which was never
+        about host behavior -- keeps compiling unchanged; every real
+        production caller (``argus.collector.loop``,
+        ``argus.api.routes.agents``) always resolves and passes a real
+        host id first (see ``Repository.ensure_local_host``).
         """
 
         observations_by_container_id = {
@@ -944,6 +1187,7 @@ class Repository:
                     name=application.name,
                     is_standalone=application.is_standalone,
                     observed_at=app_observed_at,
+                    host_id=host_id,
                 )
                 applications_written += 1
 
@@ -964,6 +1208,7 @@ class Repository:
                             name=container.name,
                             first_seen_at=container.first_seen_at,
                             last_seen_at=container.last_seen_at,
+                            host_id=host_id,
                         )
                         containers_written += 1
 
@@ -987,7 +1232,7 @@ class Repository:
 
     def get_application(self, key: str) -> ApplicationRecord | None:
         row = self._conn.execute(
-            "SELECT id, key, name, is_standalone, first_seen_at, last_seen_at "
+            "SELECT id, key, name, is_standalone, first_seen_at, last_seen_at, host_id "
             "FROM applications WHERE key = ?",
             (key,),
         ).fetchone()
@@ -1000,7 +1245,7 @@ class Repository:
         human-typed name/key."""
 
         row = self._conn.execute(
-            "SELECT id, key, name, is_standalone, first_seen_at, last_seen_at "
+            "SELECT id, key, name, is_standalone, first_seen_at, last_seen_at, host_id "
             "FROM applications WHERE id = ?",
             (application_id,),
         ).fetchone()
@@ -1008,7 +1253,7 @@ class Repository:
 
     def list_applications(self) -> tuple[ApplicationRecord, ...]:
         rows = self._conn.execute(
-            "SELECT id, key, name, is_standalone, first_seen_at, last_seen_at "
+            "SELECT id, key, name, is_standalone, first_seen_at, last_seen_at, host_id "
             "FROM applications ORDER BY key"
         ).fetchall()
         return tuple(_row_to_application_record(row) for row in rows)
@@ -1405,10 +1650,12 @@ class Repository:
         rows = self._conn.execute(
             "SELECT a.id, a.key, a.name, a.is_standalone, a.last_seen_at, "
             "       COUNT(DISTINCT s.id) AS service_count, "
-            "       COUNT(DISTINCT c.id) AS container_count "
+            "       COUNT(DISTINCT c.id) AS container_count, "
+            "       h.host_key AS host_key, h.display_name AS host_display_name "
             "FROM applications a "
             "LEFT JOIN services s ON s.application_id = a.id "
             "LEFT JOIN containers c ON c.service_id = s.id "
+            "LEFT JOIN hosts h ON h.id = a.host_id "
             "GROUP BY a.id "
             "ORDER BY a.key"
         ).fetchall()
@@ -1759,3 +2006,66 @@ class Repository:
             (incident_id,),
         ).fetchall()
         return tuple(_row_to_explanation_record(row) for row in rows)
+
+    # ---------------------------------------------------------------
+    # Realtime events (Milestone 15) -- an auxiliary, replayable "something
+    # changed" log GET /api/v1/events streams from. Never a second source
+    # of truth: `payload_json` is already-serialized JSON text the caller
+    # (argus.realtime.emitter) built from a handful of sanitized fields --
+    # this module never inspects or validates its contents, exactly like
+    # `response_json` on `incident_explanations` above.
+    # ---------------------------------------------------------------
+
+    def insert_realtime_event(
+        self, *, event_type: str, occurred_at: datetime, payload_json: str, created_at: datetime
+    ) -> int:
+        """Appends one event row; `id` (SQLite's own AUTOINCREMENT rowid)
+        is the monotonic sequence number SSE replay is built on. Never
+        raises anything but a real `sqlite3.Error`/`PersistenceError` --
+        callers that must never let this fail a tick (see
+        `argus.realtime.emitter`) are responsible for catching that
+        themselves; this method makes no policy decision about it."""
+
+        cursor = self._conn.execute(
+            "INSERT INTO realtime_events (event_type, occurred_at, payload_json, created_at) VALUES (?, ?, ?, ?)",
+            (event_type, _dt_to_text(occurred_at), payload_json, _dt_to_text(created_at)),
+        )
+        return cursor.lastrowid
+
+    def list_realtime_events_since(self, *, after_id: int, limit: int = 500) -> tuple[RealtimeEventRecord, ...]:
+        """Every event with `id > after_id`, ascending -- the SSE
+        endpoint's own poll query and its `Last-Event-ID` replay path
+        share this one method; `after_id=0` means "everything retained"
+        (a fresh connect with no prior id to resume from)."""
+
+        rows = self._conn.execute(
+            "SELECT id, event_type, occurred_at, payload_json, created_at "
+            "FROM realtime_events WHERE id > ? ORDER BY id ASC LIMIT ?",
+            (after_id, limit),
+        ).fetchall()
+        return tuple(_row_to_realtime_event_record(row) for row in rows)
+
+    def get_realtime_event_id_bounds(self) -> tuple[Optional[int], Optional[int]]:
+        """`(earliest_retained_id, latest_id)`, or `(None, None)` if no
+        event has ever been recorded. The SSE endpoint uses the earliest
+        bound to detect a `Last-Event-ID` older than what retention still
+        has -- a genuine gap, not something to silently paper over (see
+        `stream.reset`)."""
+
+        row = self._conn.execute("SELECT MIN(id), MAX(id) FROM realtime_events").fetchone()
+        return (row[0], row[1])
+
+    def prune_realtime_events(self, *, keep_last: int) -> int:
+        """Deletes every event row except the most recent `keep_last` --
+        the whole retention policy, in one statement. Safe to call after
+        every insert (see `argus.realtime.emitter`): a no-op once the
+        table is already at or under `keep_last` rows, since the
+        subquery's cutoff then computes to `id <= 0`, matching nothing
+        that could ever exist. Returns the number of rows actually
+        deleted."""
+
+        cursor = self._conn.execute(
+            "DELETE FROM realtime_events WHERE id <= (SELECT COALESCE(MAX(id), 0) - ? FROM realtime_events)",
+            (keep_last,),
+        )
+        return cursor.rowcount

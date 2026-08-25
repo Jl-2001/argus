@@ -27,7 +27,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from argus.api.config import resolve_cors_origins, resolve_host, resolve_port
 from argus.api.errors import register_exception_handlers
-from argus.api.routes import applications, bundles, doctor, evidence, explanations, incidents, system
+from argus.api.routes import agents, applications, bundles, doctor, events, evidence, explanations, hosts, incidents, system
 from argus.store.database import default_database_path
 
 __all__ = ["create_app", "run"]
@@ -87,6 +87,15 @@ def create_app(
     app.include_router(evidence.router, prefix=f"{_API_V1_PREFIX}/incidents", tags=["Evidence"])
     app.include_router(bundles.router, prefix=f"{_API_V1_PREFIX}/incidents", tags=["Evidence"])
     app.include_router(explanations.router, prefix=f"{_API_V1_PREFIX}/incidents", tags=["AI"])
+    app.include_router(events.router, prefix=_API_V1_PREFIX, tags=["Realtime"])
+    # Milestone 16 -- `hosts` is a normal, GET-only, user/dashboard-facing
+    # read route, same discipline as every router above it.  `agents` is
+    # the one deliberate exception: machine-to-machine ingestion, POST
+    # only, under its own `/api/v1/agents` prefix -- kept a clearly
+    # separate router/prefix from every read route on purpose (see that
+    # module's own docstring).
+    app.include_router(hosts.router, prefix=f"{_API_V1_PREFIX}/hosts", tags=["Hosts"])
+    app.include_router(agents.router, prefix=f"{_API_V1_PREFIX}/agents", tags=["Agents"])
 
     return app
 

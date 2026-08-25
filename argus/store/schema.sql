@@ -11,13 +11,65 @@
 -- Every CREATE is idempotent (`IF NOT EXISTS`) so reopening an
 -- already-initialized database never wipes or recreates its tables.
 
+-- Added in schema v8 (Milestone 16 -- Secure Multi-Host Agent
+-- Architecture). One row per monitored *machine*, not per Docker
+-- object -- a `Host` is what `argus.domain.host` and this whole
+-- milestone are about: which physical/virtual machine a fact came
+-- from. `host_key` is a stable, human-chosen identifier ("dell-
+-- latitude-5400"), never an IP address (see the milestone's own "Do
+-- not use IP addresses as permanent identity"). `kind` distinguishes
+-- the one synthetic `'local'` row every database has (see
+-- argus.domain.host.LOCAL_HOST_KEY) from a real remote `'agent'` host.
+-- `agent_token_hash` is NULL for the local host (it authenticates
+-- nothing -- the local collector writes directly, in-process) and,
+-- for an agent host, is always a hash (see argus.security.hash_token)
+-- -- this column never holds a plaintext credential. `last_seen_at` is
+-- this host's own heartbeat, updated on every core tick (local) or
+-- every successfully-authenticated ingest (agent); host ONLINE/STALE/
+-- OFFLINE status is *computed* from it at read time
+-- (argus.domain.host.evaluate_host_status), never stored, so it can
+-- never go stale itself.
+-- `agent_id` (distinct from `host_key`) is the credential identity a
+-- bearer token is actually issued/verified against -- `host_key` is
+-- the stable, human-chosen *display*/grouping identity a snapshot
+-- separately *claims* to be reporting for. Keeping the two separate is
+-- what makes "Known agent but wrong host identity: HTTP 403" (the
+-- milestone's own requirement) a real, checkable condition rather than
+-- a tautology: `argus.api.routes.agents` looks a host up by the
+-- request's `agent_id`, verifies the token against *that* row, and
+-- only *then* checks whether the request's own `host_key` actually
+-- matches that row's `host_key` -- a valid token whose snapshot claims
+-- a different host is rejected, not silently trusted. NULL for the
+-- local host (it authenticates nothing).
+CREATE TABLE IF NOT EXISTS hosts (
+    id                  INTEGER PRIMARY KEY,
+    host_key            TEXT NOT NULL UNIQUE,
+    agent_id            TEXT UNIQUE,
+    display_name        TEXT NOT NULL,
+    kind                TEXT NOT NULL CHECK (kind IN ('local', 'agent')),
+    agent_token_hash    TEXT,
+    agent_version       TEXT,
+    first_seen_at       TEXT NOT NULL,
+    last_seen_at        TEXT NOT NULL
+);
+
+-- `host_id` was added in schema v8 (Milestone 16). `key` stays a single,
+-- globally-unique column on purpose -- see argus.domain.host's own
+-- `scope_application_key`: a non-local host's local key is prefixed
+-- with its host_key (e.g. "dell:cnstrct") *before* it ever reaches
+-- this table, so uniqueness is achieved by the value itself, not by
+-- widening this constraint to UNIQUE(host_id, key). That is what lets
+-- this column stay untouched by the v8 migration (a plain, additive
+-- `ALTER TABLE ... ADD COLUMN`) instead of the rename/rebuild dance
+-- `_migrate_v5_to_v6` needed for a genuine constraint change.
 CREATE TABLE IF NOT EXISTS applications (
     id              INTEGER PRIMARY KEY,
     key             TEXT NOT NULL UNIQUE,
     name            TEXT NOT NULL,
     is_standalone   INTEGER NOT NULL CHECK (is_standalone IN (0, 1)),
     first_seen_at   TEXT NOT NULL,
-    last_seen_at    TEXT NOT NULL
+    last_seen_at    TEXT NOT NULL,
+    host_id         INTEGER REFERENCES hosts(id)
 );
 
 -- `service_key` exists because SQLite's UNIQUE constraint treats every
@@ -43,13 +95,26 @@ CREATE TABLE IF NOT EXISTS services (
 -- container_id is Docker's own identity string and is the permanent
 -- key here -- never the container's `name`, which Docker reuses across
 -- recreation.
+-- `host_id` was added in schema v8 (Milestone 16) -- denormalized from
+-- the owning application/service purely so a container row carries its
+-- own host without a join, matching the milestone's own "container
+-- identity must effectively include host_id + docker_container_id"
+-- requirement. `container_id` itself stays globally UNIQUE rather than
+-- UNIQUE(host_id, container_id): Docker assigns it as a 64-hex-
+-- character cryptographically-random string, so a real cross-host
+-- collision is not a practical concern (the same guarantee tools like
+-- Portainer already rely on) -- widening this constraint would need
+-- the same rename/rebuild migration `_migrate_v5_to_v6` used for
+-- `incident_explanations`, for a risk this milestone judged not worth
+-- it. Documented explicitly, not silently assumed.
 CREATE TABLE IF NOT EXISTS containers (
     id              INTEGER PRIMARY KEY,
     service_id      INTEGER NOT NULL REFERENCES services(id),
     container_id    TEXT NOT NULL UNIQUE,
     name            TEXT NOT NULL,
     first_seen_at   TEXT NOT NULL,
-    last_seen_at    TEXT NOT NULL
+    last_seen_at    TEXT NOT NULL,
+    host_id         INTEGER REFERENCES hosts(id)
 );
 
 -- Append-only: rows here are never updated once inserted. `image` is
@@ -78,6 +143,16 @@ CREATE TABLE IF NOT EXISTS observations (
 CREATE INDEX IF NOT EXISTS ix_services_application ON services(application_id);
 CREATE INDEX IF NOT EXISTS ix_containers_service ON containers(service_id);
 CREATE INDEX IF NOT EXISTS ix_observations_container_time ON observations(container_id, observed_at);
+-- ix_applications_host / ix_containers_host are deliberately NOT created
+-- here, unlike every other index above -- this script runs
+-- unconditionally against a database at *any* prior schema version
+-- (see this file's own opening comment), and a genuine pre-Milestone-16
+-- database's applications/containers tables don't have a `host_id`
+-- column yet at the point this script runs (schema.sql always runs
+-- before migrations). See `database._create_host_indexes`, called once
+-- for a brand-new database and once from `_migrate_v7_to_v8`, each only
+-- after `host_id` is guaranteed to exist -- same pattern as
+-- `_create_incident_explanations_indexes` below for `provider`.
 
 -- Added in schema v2 (Milestone 5). Exactly one logical row (id = 1) --
 -- the collector's own liveness, independent of anything it's watching.
@@ -277,3 +352,28 @@ CREATE TABLE IF NOT EXISTS incident_explanations (
 -- `database._create_incident_explanations_indexes`, called once for a
 -- brand-new database and once from the `_migrate_v5_to_v6` migration,
 -- each at the point `provider` is actually guaranteed to exist.
+
+-- Milestone 15 -- the realtime event log GET /api/v1/events streams
+-- from. `id` is the monotonic sequence number SSE's own `id:` field and
+-- `Last-Event-ID` replay are built on (see argus.realtime); it is NOT a
+-- second source of truth for application/incident/evidence state --
+-- every row here only ever says "something changed, go re-fetch the
+-- authoritative GET endpoint", never carries the state itself beyond a
+-- few bounded identifying fields. `payload_json` is a small, sanitized
+-- object (ids/keys/statuses/timestamps/counts only -- see
+-- argus.realtime.emitter) -- never a raw log sample, an env var, a
+-- Docker label, or anything from an AI explanation's own text.
+-- Cross-process safe by construction: whichever process (the collector
+-- loop, `argus explain`, argus-api itself) commits the underlying
+-- domain write also inserts the matching row here, in the same SQLite
+-- file every process already shares -- the API process's SSE endpoint
+-- only ever reads this table, on a short poll, regardless of which
+-- process produced a given row.
+CREATE TABLE IF NOT EXISTS realtime_events (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_type      TEXT NOT NULL,
+    occurred_at     TEXT NOT NULL,
+    payload_json    TEXT NOT NULL,
+    created_at      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_realtime_events_occurred_at ON realtime_events(occurred_at);

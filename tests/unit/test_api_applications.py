@@ -21,7 +21,14 @@ class TestApplicationList:
 
         assert [a["key"] for a in body] == ["alpha", "beta"]  # key ascending, deterministic
         assert all(a["status"] == "UNHEALTHY" for a in body)
-        assert all(set(a.keys()) == {"key", "name", "status", "services", "containers", "last_seen_at"} for a in body)
+        assert all(
+            set(a.keys())
+            == {"key", "name", "status", "services", "containers", "last_seen_at", "host_key", "host_name"}
+            for a in body
+        )
+        # Milestone 16 -- every seeded application here predates hosts
+        # entirely, so both are the local host's fixed labels.
+        assert all(a["host_key"] == "local" for a in body)
 
     def test_status_query_filter(self, tmp_path):
         db_path = tmp_path / "a.db"

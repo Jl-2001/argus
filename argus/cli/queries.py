@@ -23,6 +23,7 @@ from datetime import datetime
 from typing import Optional, Sequence
 
 from argus.domain.health import DEFAULT_HEALTH_RULES, HealthRules
+from argus.domain.host import LOCAL_HOST_KEY, HostStatus, evaluate_host_status
 from argus.domain.models import EvidenceCategory, EvidenceSeverity, HealthStatus
 from argus.store.repository import (
     ApplicationCountsRecord,
@@ -157,6 +158,50 @@ class ApplicationSummary:
     service_count: int
     container_count: int
     last_seen_at: datetime
+    #: Milestone 16. Defaulted so this dataclass's positional/keyword
+    #: shape is unchanged for every pre-existing caller that never
+    #: cared about hosts.
+    host_key: str = LOCAL_HOST_KEY
+    host_display_name: str = "Local Host"
+
+
+def _host_freshness_map(
+    repository: Repository, *, now: datetime, local_data_is_fresh: bool
+) -> dict[str, bool]:
+    """Milestone 16: whether an application's *owning host* currently
+    counts as a trustworthy source of "current state", keyed by
+    ``host_key``.
+
+    Before this milestone, "is Argus's data fresh" was a single,
+    global question answered once from the local `collector_state` row
+    (`get_collector_status`) and applied uniformly to every
+    application. That is no longer right once applications can come
+    from different, independently-live hosts: a remote agent going
+    silent must make *its own* applications read UNKNOWN (see the
+    milestone's own "Remote Host Offline Incident" -- "its applications
+    should surface UNKNOWN/stale through existing freshness
+    semantics"), without that same silence affecting the local host's
+    own, still-live applications, and vice versa.
+
+    The local host keeps using the exact original signal
+    (`local_data_is_fresh`, i.e. `collector_status.data_is_fresh`) --
+    byte-for-byte the same rule a single-host installation has always
+    used. A remote agent host is fresh exactly when
+    `argus.domain.host.evaluate_host_status` currently classifies it
+    ONLINE -- STALE/OFFLINE both mean "don't trust this host's last
+    recorded transition as current", the same way a STALE/FAILING local
+    collector already does.
+    """
+
+    freshness = {LOCAL_HOST_KEY: local_data_is_fresh}
+    for host in repository.list_hosts():
+        if host.host_key == LOCAL_HOST_KEY:
+            continue
+        status = evaluate_host_status(
+            last_seen_at=host.last_seen_at, now=now, poll_interval_seconds=_HOST_STATUS_POLL_INTERVAL_SECONDS
+        )
+        freshness[host.host_key] = status == HostStatus.ONLINE
+    return freshness
 
 
 def list_application_summaries(
@@ -168,17 +213,20 @@ def list_application_summaries(
     invocations harder to read as a stable table."""
 
     collector_status = get_collector_status(repository, now=now, rules=rules)
+    freshness_by_host = _host_freshness_map(repository, now=now, local_data_is_fresh=collector_status.data_is_fresh)
     return [
         ApplicationSummary(
             key=record.key,
             name=record.name,
             status=_current_status(
                 repository, scope="application", scope_id=record.id,
-                data_is_fresh=collector_status.data_is_fresh,
+                data_is_fresh=freshness_by_host.get(record.host_key, False),
             ),
             service_count=record.service_count,
             container_count=record.container_count,
             last_seen_at=record.last_seen_at,
+            host_key=record.host_key,
+            host_display_name=record.host_display_name,
         )
         for record in repository.list_applications_with_counts()
     ]
@@ -252,6 +300,9 @@ class ApplicationDetail:
     last_seen_at: datetime
     services: tuple[ServiceDetail, ...]
     open_incident: Optional[IncidentWithApplicationRecord]
+    #: Milestone 16 -- see `ApplicationSummary`'s own fields.
+    host_key: str = LOCAL_HOST_KEY
+    host_display_name: str = "Local Host"
 
 
 def get_application_detail(
@@ -277,16 +328,23 @@ def get_application_detail(
         return None
 
     record = repository.get_application(key)
+    host = repository.get_host_by_id(record.host_id) if record.host_id is not None else None
+    host_key = host.host_key if host is not None else LOCAL_HOST_KEY
+
     collector_status = get_collector_status(repository, now=now, rules=rules)
-    app_status = _current_status(
-        repository, scope="application", scope_id=record.id, data_is_fresh=collector_status.data_is_fresh
-    )
+    # See `_host_freshness_map`'s own docstring -- this application's
+    # (and its services') freshness is judged by its *owning host*, not
+    # unconditionally by the local collector's own liveness.
+    data_is_fresh = _host_freshness_map(
+        repository, now=now, local_data_is_fresh=collector_status.data_is_fresh
+    ).get(host_key, False)
+
+    app_status = _current_status(repository, scope="application", scope_id=record.id, data_is_fresh=data_is_fresh)
 
     services: list[ServiceDetail] = []
     for service_record in repository.get_services_for_application(record.id):
         service_status = _current_status(
-            repository, scope="service", scope_id=service_record.id,
-            data_is_fresh=collector_status.data_is_fresh,
+            repository, scope="service", scope_id=service_record.id, data_is_fresh=data_is_fresh,
         )
         display_name = service_record.compose_service or service_record.name
 
@@ -334,7 +392,112 @@ def get_application_detail(
         last_seen_at=record.last_seen_at,
         services=tuple(services),
         open_incident=open_incident,
+        host_key=host.host_key if host is not None else LOCAL_HOST_KEY,
+        host_display_name=host.display_name if host is not None else "Local Host",
     )
+
+
+# --------------------------------------------------------------------------
+# Hosts -- Milestone 16
+# --------------------------------------------------------------------------
+
+#: Host ONLINE/STALE/OFFLINE status (see `argus.domain.host
+#: .evaluate_host_status`) needs a poll-interval scale to judge
+#: "recent" against. This module deliberately cannot import the real
+#: configured interval from either `argus.collector.loop`
+#: (`argus.api`'s own architecture guard forbids any non-doctor route
+#: module from transitively reaching `docker`, which that module
+#: imports) or from a remote agent (its actual
+#: `ARGUS_AGENT_POLL_INTERVAL` is never persisted centrally -- see the
+#: milestone's own "Host Heartbeat" section, which only asks for a
+#: threshold "for example"). A single constant matching every
+#: component's own documented default (15s) is used for every host
+#: uniformly instead -- a deliberate v1 simplification, not a
+#: precisely-tracked per-host value.
+_HOST_STATUS_POLL_INTERVAL_SECONDS = 15.0
+
+
+@dataclass(frozen=True, slots=True)
+class HostView:
+    host_key: str
+    display_name: str
+    kind: str
+    status: "HostStatus"
+    last_seen_at: datetime
+    agent_version: Optional[str]
+    application_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class HostDetail:
+    summary: HostView
+    first_seen_at: datetime
+    applications: tuple[ApplicationSummary, ...]
+
+
+def list_host_views(repository: Repository, *, now: datetime) -> list[HostView]:
+    """Every registered host (local and agent), with a live-computed
+    ONLINE/STALE/OFFLINE status -- never a stored one; see
+    `argus.domain.host.evaluate_host_status`."""
+
+    counts_by_host_key: dict[str, int] = {}
+    for record in repository.list_applications_with_counts():
+        counts_by_host_key[record.host_key] = counts_by_host_key.get(record.host_key, 0) + 1
+
+    return [
+        HostView(
+            host_key=host.host_key,
+            display_name=host.display_name,
+            kind=host.kind,
+            status=evaluate_host_status(
+                last_seen_at=host.last_seen_at, now=now, poll_interval_seconds=_HOST_STATUS_POLL_INTERVAL_SECONDS
+            ),
+            last_seen_at=host.last_seen_at,
+            agent_version=host.agent_version,
+            application_count=counts_by_host_key.get(host.host_key, 0),
+        )
+        for host in repository.list_hosts()
+    ]
+
+
+def get_host_detail(repository: Repository, *, now: datetime, host_key: str) -> Optional[HostDetail]:
+    host = repository.get_host_by_key(host_key)
+    if host is None:
+        return None
+
+    collector_status = get_collector_status(repository, now=now)
+    freshness_by_host = _host_freshness_map(repository, now=now, local_data_is_fresh=collector_status.data_is_fresh)
+
+    applications = [
+        ApplicationSummary(
+            key=record.key,
+            name=record.name,
+            status=_current_status(
+                repository, scope="application", scope_id=record.id,
+                data_is_fresh=freshness_by_host.get(record.host_key, False),
+            ),
+            service_count=record.service_count,
+            container_count=record.container_count,
+            last_seen_at=record.last_seen_at,
+            host_key=record.host_key,
+            host_display_name=record.host_display_name,
+        )
+        for record in repository.list_applications_with_counts()
+        if record.host_key == host_key
+    ]
+
+    summary = HostView(
+        host_key=host.host_key,
+        display_name=host.display_name,
+        kind=host.kind,
+        status=evaluate_host_status(
+            last_seen_at=host.last_seen_at, now=now, poll_interval_seconds=_HOST_STATUS_POLL_INTERVAL_SECONDS
+        ),
+        last_seen_at=host.last_seen_at,
+        agent_version=host.agent_version,
+        application_count=len(applications),
+    )
+    return HostDetail(summary=summary, first_seen_at=host.first_seen_at, applications=tuple(applications))
 
 
 # --------------------------------------------------------------------------

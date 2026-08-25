@@ -53,6 +53,7 @@ from typing import Callable, Optional, Sequence
 from argus.collectors.docker_client import DockerClient, DockerUnavailableError
 from argus.collectors.docker_collector import discover
 from argus.domain.health import DEFAULT_HEALTH_RULES, HealthRules
+from argus.domain.host import LOCAL_HOST_KEY
 from argus.domain.models import DockerHealth, EvidenceCategory, Observation
 from argus.evidence.association import DEFAULT_ASSOCIATION_WINDOW_SECONDS, associate_evidence
 from argus.evidence.collector import (
@@ -62,7 +63,9 @@ from argus.evidence.collector import (
     docker_fact_evidence,
 )
 from argus.evidence.persistence import persist_candidates
-from argus.incidents.engine import IncidentProcessingError, process_transitions_and_incidents
+from argus.incidents.engine import IncidentProcessingError
+from argus.ingestion.pipeline import persist_snapshot, process_incidents_for_snapshot
+from argus.realtime.emitter import emit_collector_tick, emit_evidence_health_changed, emit_evidence_updated
 from argus.store.database import PersistenceError
 from argus.store.repository import Repository, resolve_observation_health
 
@@ -234,6 +237,7 @@ class CollectorLoop:
         rules: HealthRules = DEFAULT_HEALTH_RULES,
         clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
         sleep: Callable[[float], None] = time.sleep,
+        host_display_name: str = "Local Host",
     ) -> None:
         self._docker_client = client
         self._repository = repository
@@ -241,6 +245,14 @@ class CollectorLoop:
         self._rules = rules
         self._clock = clock
         self._sleep = sleep
+        # Milestone 16 -- resolved lazily (see `_local_host_id`), not
+        # here: `repository` is already open by construction time in
+        # every real caller, but resolving it eagerly would mean every
+        # existing test building a `CollectorLoop` starts writing a
+        # `hosts` row it never asked for, even for tests that never call
+        # `run_once`.
+        self._host_display_name = host_display_name
+        self._host_id: Optional[int] = None
 
     # -----------------------------------------------------------------
     # One tick
@@ -296,6 +308,7 @@ class CollectorLoop:
         """
 
         tick_at = self._clock()
+        host_id = self._local_host_id(tick_at=tick_at)
         self._repository.record_tick_started(at=tick_at)
 
         try:
@@ -306,12 +319,12 @@ class CollectorLoop:
                 history_provider=self._history_provider(tick_at),
             )
         except DockerUnavailableError as exc:
-            return self._fail(exc)
+            return self._fail(exc, tick_at=tick_at)
 
         try:
             resolved_observations = self._resolve_observations(result)
         except MissingEvaluationError as exc:
-            return self._fail(exc)
+            return self._fail(exc, tick_at=tick_at)
 
         # Captured *before* persisting this tick's new observations, so
         # "before" genuinely means the previous tick's reading -- used
@@ -323,29 +336,46 @@ class CollectorLoop:
             for observation in resolved_observations
         }
 
+        # Step 5 (persist_discovery) runs through the same shared
+        # pipeline `argus.api.routes.agents` calls for a remote agent's
+        # snapshot -- see `argus.ingestion.pipeline`'s own docstring for
+        # why this must not be two separately-maintained copies of the
+        # same sequence. `host_key=LOCAL_HOST_KEY` makes the
+        # application-key host-scoping step inside it a complete no-op
+        # for this, the local collector's own call -- every existing
+        # single-host application key is unaffected. `scoped_applications`
+        # (identical objects to `result.applications` here, since the
+        # scoping is a no-op) is what every step below must use, not
+        # `result.applications` -- see `persist_snapshot`'s own docstring.
         try:
-            self._repository.persist_discovery(
-                applications=result.applications, observations=resolved_observations
+            persist_report, scoped_applications = persist_snapshot(
+                self._repository,
+                host_id=host_id,
+                host_key=LOCAL_HOST_KEY,
+                applications=result.applications,
+                observations=resolved_observations,
             )
         except PersistenceError as exc:
-            return self._fail(exc)
+            return self._fail(exc, tick_at=tick_at)
 
         evidence_signals_created, evidence_error = self._collect_and_persist_evidence(
             result, resolved_observations, previous_observation_by_container_id, tick_at
         )
 
+        # Step 6: transition/incident detection -- kept as its own,
+        # separately-failable step exactly as before this refactor (a
+        # failure here still leaves this tick's already-persisted
+        # observations in place; only its transition/incident
+        # bookkeeping is missing -- see the Milestone 6 report).
         try:
-            container_statuses = {
-                container_id: evaluation.status for container_id, evaluation in result.evaluations.items()
-            }
-            incident_result = process_transitions_and_incidents(
-                repository=self._repository,
-                applications=result.applications,
-                container_statuses=container_statuses,
-                occurred_at=tick_at,
+            incident_result = process_incidents_for_snapshot(
+                self._repository,
+                applications=scoped_applications,
+                observations=resolved_observations,
+                tick_at=tick_at,
             )
         except (IncidentProcessingError, PersistenceError) as exc:
-            return self._fail(exc)
+            return self._fail(exc, tick_at=tick_at)
 
         evidence_associations, association_error = self._associate_evidence(tick_at)
 
@@ -364,6 +394,7 @@ class CollectorLoop:
         # is the honest state here.
         combined_evidence_error = evidence_error if evidence_error is not None else association_error
         if self._config.collect_evidence:
+            evidence_was_healthy = self._repository.get_collector_state().consecutive_evidence_failures == 0
             if combined_evidence_error is None:
                 self._repository.record_evidence_tick_success(at=tick_at)
             else:
@@ -371,8 +402,30 @@ class CollectorLoop:
                     self._repository.record_evidence_tick_failure(error=combined_evidence_error)
                 except PersistenceError:
                     logger.error("could not record evidence tick failure to collector_state (database unavailable?)")
+            evidence_is_healthy = self._repository.get_collector_state().consecutive_evidence_failures == 0
+            if evidence_is_healthy != evidence_was_healthy:
+                emit_evidence_health_changed(self._repository, healthy=evidence_is_healthy, tick_at=tick_at, now=tick_at)
+
+        emit_evidence_updated(
+            self._repository, signals_created=evidence_signals_created, associations=evidence_associations,
+            tick_at=tick_at, now=tick_at,
+        )
 
         self._repository.record_tick_success(at=tick_at)
+        # The local host's own heartbeat -- mirrors exactly what
+        # `argus.api.routes.agents` does for a remote agent on every
+        # successfully-authenticated ingest, so `GET /api/v1/hosts`'s
+        # ONLINE/STALE/OFFLINE classification (`argus.domain.host
+        # .evaluate_host_status`) reflects reality for the local host
+        # too, not just remote ones -- without this, a local host's
+        # `last_seen_at` would only ever be stamped once, at bootstrap,
+        # and every long-running Argus install would eventually show
+        # its own local host as OFFLINE despite ticking successfully.
+        self._repository.record_host_heartbeat(host_id=host_id, at=tick_at)
+        emit_collector_tick(
+            self._repository, success=True, tick_at=tick_at,
+            applications=len(result.applications), observations=len(resolved_observations), now=tick_at,
+        )
 
         if result.skipped:
             logger.warning(
@@ -409,6 +462,34 @@ class CollectorLoop:
             evidence_error=combined_evidence_error,
             error=None,
         )
+
+    def _local_host_id(self, *, tick_at: datetime) -> int:
+        """Resolves (and caches, for the lifetime of this loop) the
+        local host's own row id -- see ``Repository.ensure_local_host``.
+        Called once per tick rather than once at construction so a
+        loop's ``host_display_name`` (e.g. read from ``ARGUS_HOST_NAME``
+        at process startup) is applied the very first time this loop
+        actually does anything, not silently skipped for a loop object
+        constructed before the database was ready.
+
+        Takes ``tick_at`` (this tick's own, already-read clock value)
+        rather than reading ``self._clock()`` itself -- ``run_once``'s
+        one-clock-read-per-tick discipline (see its own docstring) must
+        hold even on the very first tick, when this method also happens
+        to bootstrap the local host row; a second, independent clock
+        read here would silently consume an extra value from an
+        injected test clock and desynchronize every subsequent
+        ``self._clock()`` call in the same tick from the caller's own
+        expectations -- exactly the bug a real Milestone 16 regression
+        test caught (see ``tests/integration/test_chaos_stack.py``'s
+        own ``TestTransitionTimestampAccuracyEndToEnd``).
+        """
+
+        if self._host_id is None:
+            self._host_id = self._repository.ensure_local_host(
+                display_name=self._host_display_name, now=tick_at
+            )
+        return self._host_id
 
     def _history_provider(self, tick_at: datetime) -> Callable[[str], Sequence[Observation]]:
         """Build a `discover()` history provider bound to this one tick.
@@ -613,16 +694,25 @@ class CollectorLoop:
             )
         return resolved
 
-    def _fail(self, exc: BaseException) -> TickResult:
+    def _fail(self, exc: BaseException, *, tick_at: Optional[datetime] = None) -> TickResult:
         message = _sanitize_error(exc)
         logger.warning("collector tick failed: %s", message)
+        resolved_tick_at = tick_at if tick_at is not None else self._clock()
         try:
             self._repository.record_tick_failure(error=message)
         except PersistenceError:
             # The database itself may be the thing that's unavailable --
             # log it and keep the loop alive rather than crash trying to
-            # record that we couldn't record a failure.
+            # record that we couldn't record a failure. Since the
+            # failure state itself couldn't be persisted, no
+            # `collector.tick` event is emitted either -- see
+            # argus.realtime.emitter's own "emit-after-commit-only" rule.
             logger.error("could not record tick failure to collector_state (database unavailable?)")
+        else:
+            emit_collector_tick(
+                self._repository, success=False, tick_at=resolved_tick_at,
+                applications=0, observations=0, now=resolved_tick_at,
+            )
         return TickResult(
             success=False,
             applications=0,

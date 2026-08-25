@@ -9,6 +9,7 @@ business logic lives here; see ``argus.collector.loop`` for that.
 from __future__ import annotations
 
 import logging
+import os
 import sys
 
 from argus.collector.loop import DEFAULT_COLLECTOR_CONFIG, CollectorLoop
@@ -17,6 +18,14 @@ from argus.store.database import DatabaseOpenError, SchemaError, default_databas
 from argus.store.repository import Repository
 
 logger = logging.getLogger("argus.run_collector")
+
+#: Milestone 16 -- lets a control-plane operator give their own machine
+#: a real display name (e.g. "MacBook") in `argus agents`/`GET
+#: /api/v1/hosts`, the same way a remote agent's `ARGUS_HOST_NAME` does
+#: (see `argus.agent.config`). Purely cosmetic -- `LOCAL_HOST_KEY`
+#: ("local") is never configurable, since it's the one thing this
+#: whole migration's backward compatibility depends on staying fixed.
+_DEFAULT_LOCAL_HOST_NAME = "Local Host"
 
 
 def main() -> int:
@@ -52,7 +61,13 @@ def main() -> int:
         return 1
 
     repository = Repository(connection)
-    loop = CollectorLoop(client=client, repository=repository, config=DEFAULT_COLLECTOR_CONFIG)
+    host_display_name = os.environ.get("ARGUS_HOST_NAME", _DEFAULT_LOCAL_HOST_NAME)
+    loop = CollectorLoop(
+        client=client,
+        repository=repository,
+        config=DEFAULT_COLLECTOR_CONFIG,
+        host_display_name=host_display_name,
+    )
 
     logger.info(
         "Argus collector starting (db=%s, poll_interval=%ss)",

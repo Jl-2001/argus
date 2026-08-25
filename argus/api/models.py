@@ -84,6 +84,9 @@ __all__ = [
     "UsageResponse",
     "ExplanationResponse",
     "ExplanationsListResponse",
+    "HostSummaryResponse",
+    "HostDetailResponse",
+    "AgentIngestResponse",
 ]
 
 
@@ -136,6 +139,9 @@ class ApplicationSummaryResponse(_Model):
     services: int
     containers: int
     last_seen_at: Optional[str]
+    #: Milestone 16 -- which monitored machine this application is on.
+    host_key: str
+    host_name: str
 
     @classmethod
     def from_domain(cls, summary: "queries.ApplicationSummary") -> "ApplicationSummaryResponse":
@@ -146,6 +152,8 @@ class ApplicationSummaryResponse(_Model):
             services=summary.service_count,
             containers=summary.container_count,
             last_seen_at=iso(summary.last_seen_at),
+            host_key=summary.host_key,
+            host_name=summary.host_display_name,
         )
 
 
@@ -257,6 +265,8 @@ class ApplicationDetailResponse(_Model):
     last_seen_at: Optional[str]
     services: list[ServiceDetailResponse]
     open_incident: Optional[OpenIncidentBriefResponse]
+    host_key: str
+    host_name: str
 
     @classmethod
     def from_domain(cls, detail: "queries.ApplicationDetail") -> "ApplicationDetailResponse":
@@ -271,6 +281,8 @@ class ApplicationDetailResponse(_Model):
                 if detail.open_incident is not None
                 else None
             ),
+            host_key=detail.host_key,
+            host_name=detail.host_display_name,
         )
 
 
@@ -594,3 +606,65 @@ class ExplanationResponse(_Model):
 class ExplanationsListResponse(_Model):
     incident_id: int
     explanations: list[ExplanationResponse]
+
+
+# --------------------------------------------------------------------------
+# Hosts / Agents -- Milestone 16
+# --------------------------------------------------------------------------
+
+
+class HostSummaryResponse(_Model):
+    """Deliberately never includes `agent_token_hash` or any other
+    authentication metadata -- see `argus.store.repository.HostRecord`'s
+    own docstring on why that field exists on the record at all but must
+    never reach a response."""
+
+    host_key: str
+    display_name: str
+    kind: str
+    status: str
+    last_seen_at: Optional[str]
+    agent_version: Optional[str]
+    application_count: int
+
+    @classmethod
+    def from_domain(cls, view: "queries.HostView") -> "HostSummaryResponse":
+        return cls(
+            host_key=view.host_key,
+            display_name=view.display_name,
+            kind=view.kind,
+            status=view.status.value,
+            last_seen_at=iso(view.last_seen_at),
+            agent_version=view.agent_version,
+            application_count=view.application_count,
+        )
+
+
+class HostDetailResponse(HostSummaryResponse):
+    first_seen_at: Optional[str]
+    applications: list[ApplicationSummaryResponse]
+
+    @classmethod
+    def from_domain(cls, view: "queries.HostDetail") -> "HostDetailResponse":
+        return cls(
+            host_key=view.summary.host_key,
+            display_name=view.summary.display_name,
+            kind=view.summary.kind,
+            status=view.summary.status.value,
+            last_seen_at=iso(view.summary.last_seen_at),
+            agent_version=view.summary.agent_version,
+            application_count=view.summary.application_count,
+            first_seen_at=iso(view.first_seen_at),
+            applications=[ApplicationSummaryResponse.from_domain(app) for app in view.applications],
+        )
+
+
+class AgentIngestResponse(_Model):
+    """The one response body `POST /api/v1/agents/ingest` ever returns
+    on success -- deliberately minimal, never echoes anything from the
+    request body back."""
+
+    status: str  # "accepted" | "duplicate"
+    host_key: str
+    applications_written: int
+    observations_written: int

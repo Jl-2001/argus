@@ -13,6 +13,24 @@ back to back. This is local/homelab scale (see the milestone's own
 "Performance" note) -- the per-request `open_database` cost (a few
 idempotent `CREATE TABLE IF NOT EXISTS` statements) is not worth
 building connection-pooling infrastructure to avoid.
+
+`open_database(..., check_same_thread=False)`: this is *not* only for
+the SSE endpoint's long-lived, repeatedly-polled connection (Milestone
+15's original reason for adding the flag) -- it turned out every
+ordinary route needs it too. FastAPI resolves a sync `yield`
+dependency (opening the connection) and runs the sync route handler
+(using it) as two *separate* `run_in_threadpool` dispatches; anyio's
+thread pool is free to hand each dispatch a different worker thread,
+so "open on thread A, use on thread B" is a real, observed failure
+mode under genuine concurrent load (`sqlite3.ProgrammingError: SQLite
+objects created in a thread can only be used in that same thread`) --
+caught during this milestone's own manual browser verification, not
+by any single-request-at-a-time test. `check_same_thread=False` is
+safe here for the same reason it was already safe for the SSE
+connection: access within one request stays strictly sequential (the
+dependency fully resolves before the handler runs), never genuinely
+concurrent multi-thread access, which is the actual hazard
+`check_same_thread` exists to catch.
 """
 
 from __future__ import annotations
@@ -33,12 +51,16 @@ __all__ = ["get_repository", "get_now"]
 def get_repository(request: Request) -> Iterator[Repository]:
     """Opens one connection against `request.app.state.database_path`
     (set once by `create_app`), yields a `Repository` over it, and
-    always closes it afterward -- even if the route raises. Reuses
-    `open_database` exactly as every ordinary CLI command does, so a
-    missing database file is bootstrapped the same established way (see
-    that function's own docstring), and a genuinely broken database
-    raises the same `DatabaseOpenError`/`SchemaError` the CLI already
-    knows how to report -- turned into a clean 503 by
+    always closes it afterward -- even if the route raises. Used by
+    every route, including `argus.api.routes.events`'s SSE endpoint
+    (which additionally polls the same connection repeatedly across
+    the life of one long-lived request).
+
+    Reuses `open_database` exactly as every ordinary CLI command does,
+    so a missing database file is bootstrapped the same established
+    way (see that function's own docstring), and a genuinely broken
+    database raises the same `DatabaseOpenError`/`SchemaError` the CLI
+    already knows how to report -- turned into a clean 503 by
     `database_unavailable` instead of a stack trace.
 
     Also catches a plain `sqlite3.Error` (e.g. a file that exists but
@@ -52,7 +74,7 @@ def get_repository(request: Request) -> Iterator[Repository]:
     """
 
     try:
-        connection = open_database(request.app.state.database_path)
+        connection = open_database(request.app.state.database_path, check_same_thread=False)
     except (DatabaseOpenError, SchemaError) as exc:
         raise database_unavailable(str(exc)) from exc
     except sqlite3.Error as exc:

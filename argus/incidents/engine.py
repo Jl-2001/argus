@@ -34,6 +34,10 @@ from argus.store.repository import Repository
 __all__ = [
     "IncidentProcessingError",
     "IncidentProcessingResult",
+    "TransitionOccurred",
+    "IncidentOpened",
+    "IncidentUpdated",
+    "IncidentResolved",
     "incident_severity_rank",
     "process_transitions_and_incidents",
 ]
@@ -54,26 +58,88 @@ class IncidentProcessingError(PersistenceError):
 
 
 @dataclass(frozen=True, slots=True)
+class TransitionOccurred:
+    """One committed container/service/application transition from this
+    tick -- Milestone 15's realtime layer turns these into
+    `*.status_changed` events, after `process_transitions_and_incidents`'s
+    own transaction has already committed (see that function's own
+    docstring on transaction boundaries; nothing here is ever built from
+    an uncommitted write)."""
+
+    scope: str  # "application" | "service" | "container"
+    scope_id: int
+    application_key: str
+    from_status: HealthStatus | None
+    to_status: HealthStatus
+    transition_id: int
+    occurred_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class IncidentOpened:
+    incident_id: int
+    application_key: str
+    opening_status: HealthStatus
+
+
+@dataclass(frozen=True, slots=True)
+class IncidentUpdated:
+    """Emitted only on a genuine `worst_status` escalation -- never once
+    per tick an already-open incident merely continues (see
+    `_update_incident_lifecycle`'s own "nothing to write" branch)."""
+
+    incident_id: int
+    application_key: str
+    worst_status: HealthStatus
+
+
+@dataclass(frozen=True, slots=True)
+class IncidentResolved:
+    incident_id: int
+    application_key: str
+
+
+@dataclass(frozen=True, slots=True)
 class IncidentProcessingResult:
-    """What happened while processing one tick's worth of applications."""
+    """What happened while processing one tick's worth of applications.
+
+    The four `*_created`/`*_opened`/`*_updated`/`*_resolved` counts are
+    Milestone 6's original summary and remain exactly as they always
+    were. The four `transitions`/`opened_incidents`/`updated_incidents`/
+    `resolved_incidents` tuples are Milestone 15's additive detail --
+    the same events, with the actual identifying data (scope/status/
+    incident id/application key) a realtime consumer needs to build an
+    event payload, rather than just a number to log.
+    """
 
     transitions_created: int
     incidents_opened: int
     incidents_updated: int
     incidents_resolved: int
+    transitions: tuple[TransitionOccurred, ...] = ()
+    opened_incidents: tuple[IncidentOpened, ...] = ()
+    updated_incidents: tuple[IncidentUpdated, ...] = ()
+    resolved_incidents: tuple[IncidentResolved, ...] = ()
 
 
 class _Stats:
     """Mutable accumulator, private to one `process_transitions_and_incidents`
     call -- never exposed; the public result is the frozen snapshot above."""
 
-    __slots__ = ("transitions_created", "incidents_opened", "incidents_updated", "incidents_resolved")
+    __slots__ = (
+        "transitions_created", "incidents_opened", "incidents_updated", "incidents_resolved",
+        "transitions", "opened_incidents", "updated_incidents", "resolved_incidents",
+    )
 
     def __init__(self) -> None:
         self.transitions_created = 0
         self.incidents_opened = 0
         self.incidents_updated = 0
         self.incidents_resolved = 0
+        self.transitions: list[TransitionOccurred] = []
+        self.opened_incidents: list[IncidentOpened] = []
+        self.updated_incidents: list[IncidentUpdated] = []
+        self.resolved_incidents: list[IncidentResolved] = []
 
 
 @dataclass(frozen=True, slots=True)
@@ -314,6 +380,7 @@ def _update_incident_lifecycle(
             resolving_transition_id=outcome.transition_id,
         )
         stats.incidents_resolved += 1
+        stats.resolved_incidents.append(IncidentResolved(incident_id=open_incident.id, application_key=application_key))
         logger.info("incident resolved: %s", failure_signature)
         return
 
@@ -322,7 +389,7 @@ def _update_incident_lifecycle(
     open_incident = repository.get_open_incident(failure_signature=failure_signature)
 
     if open_incident is None:
-        repository.open_incident(
+        incident_id = repository.open_incident(
             scope_id=application_row_id,
             failure_signature=failure_signature,
             opened_at=occurred_at,
@@ -330,6 +397,9 @@ def _update_incident_lifecycle(
             opening_transition_id=outcome.transition_id,
         )
         stats.incidents_opened += 1
+        stats.opened_incidents.append(
+            IncidentOpened(incident_id=incident_id, application_key=application_key, opening_status=outcome.to_status)
+        )
         logger.info("incident opened: %s (%s)", failure_signature, outcome.to_status.value)
         return
 
@@ -340,6 +410,9 @@ def _update_incident_lifecycle(
     if new_worst != open_incident.worst_status:
         repository.update_incident_worst_status(incident_id=open_incident.id, worst_status=new_worst)
         stats.incidents_updated += 1
+        stats.updated_incidents.append(
+            IncidentUpdated(incident_id=open_incident.id, application_key=application_key, worst_status=new_worst)
+        )
         logger.info(
             "incident worst status updated: %s (%s -> %s)",
             failure_signature,
@@ -350,6 +423,23 @@ def _update_incident_lifecycle(
     # isn't worse than what's already recorded -- nothing to write, and
     # deliberately no INFO log for it (see the module docstring on not
     # spamming logs for changes that aren't actually escalations).
+
+
+def _record_transition_event(
+    stats: _Stats, *, scope: str, scope_id: int, application_key: str, outcome: _TransitionOutcome
+) -> None:
+    """Appends a `TransitionOccurred` for one `changed` outcome -- shared
+    by all three scopes' call sites in `_process_application` so there is
+    one place this construction happens, not three."""
+
+    assert outcome.changed and outcome.transition_id is not None and outcome.occurred_at is not None
+    stats.transitions.append(
+        TransitionOccurred(
+            scope=scope, scope_id=scope_id, application_key=application_key,
+            from_status=outcome.from_status, to_status=outcome.to_status,
+            transition_id=outcome.transition_id, occurred_at=outcome.occurred_at,
+        )
+    )
 
 
 def _process_application(
@@ -400,6 +490,10 @@ def _process_application(
             )
             if container_outcome.changed:
                 stats.transitions_created += 1
+                _record_transition_event(
+                    stats, scope="container", scope_id=container_record.id,
+                    application_key=application.key, outcome=container_outcome,
+                )
 
         service_record = repository.get_service_by_key(
             application_id=application_record.id, compose_service=service.compose_service
@@ -427,6 +521,10 @@ def _process_application(
         )
         if service_outcome.changed:
             stats.transitions_created += 1
+            _record_transition_event(
+                stats, scope="service", scope_id=service_record.id,
+                application_key=application.key, outcome=service_outcome,
+            )
             if service_outcome.occurred_at is not None:
                 changed_service_timestamps.append(service_outcome.occurred_at)
 
@@ -450,6 +548,10 @@ def _process_application(
     )
     if application_outcome.changed:
         stats.transitions_created += 1
+        _record_transition_event(
+            stats, scope="application", scope_id=application_record.id,
+            application_key=application.key, outcome=application_outcome,
+        )
         _update_incident_lifecycle(
             repository,
             application_key=application.key,
@@ -496,4 +598,8 @@ def process_transitions_and_incidents(
         incidents_opened=stats.incidents_opened,
         incidents_updated=stats.incidents_updated,
         incidents_resolved=stats.incidents_resolved,
+        transitions=tuple(stats.transitions),
+        opened_incidents=tuple(stats.opened_incidents),
+        updated_incidents=tuple(stats.updated_incidents),
+        resolved_incidents=tuple(stats.resolved_incidents),
     )

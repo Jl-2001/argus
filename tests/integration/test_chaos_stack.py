@@ -30,6 +30,7 @@ import docker.errors
 import pytest
 
 import argus.collector.loop as loop_module
+import argus.ingestion.pipeline as pipeline_module
 from argus.cli.main import main as cli_main
 from argus.collector.loop import CollectorConfig, CollectorLoop
 from argus.collectors.docker_client import DockerClient
@@ -554,7 +555,16 @@ class TestTransitionTimestampAccuracyEndToEnd:
             def boom(**kwargs):
                 raise IncidentProcessingError("simulated transition/incident processing failure at T1")
 
-            monkeypatch.setattr(loop_module, "process_transitions_and_incidents", boom)
+            # Milestone 16: `CollectorLoop.run_once` now calls
+            # `argus.ingestion.pipeline.process_incidents_for_snapshot`
+            # (the one shared pipeline both the local collector and the
+            # agent ingestion route go through -- see that module's own
+            # docstring), which in turn calls
+            # `process_transitions_and_incidents` -- so that is the
+            # module this monkeypatch must target, not
+            # `argus.collector.loop` (which no longer imports that name
+            # directly at all).
+            monkeypatch.setattr(pipeline_module, "process_transitions_and_incidents", boom)
             t1_result = loop.run_once()
             assert t1_result.success is False
 

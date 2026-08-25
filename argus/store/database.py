@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import sqlite3
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -32,7 +33,7 @@ __all__ = [
     "inspect_database_readonly",
 ]
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 8
 
 _SCHEMA_PATH = Path(__file__).resolve().parent / "schema.sql"
 
@@ -56,7 +57,19 @@ REQUIRED_TABLES: tuple[str, ...] = (
     "log_signals",
     "incident_evidence",
     "incident_explanations",
+    "realtime_events",
+    "hosts",
 )
+
+#: The synthetic host every observation belonged to before Milestone
+#: 16 -- see `argus.domain.host.LOCAL_HOST_KEY`. Duplicated here as a
+#: plain literal (rather than importing `argus.domain.host`) because
+#: this module deliberately never imports anything above it in the
+#: dependency graph -- it does not know what an "Application" or a
+#: "Host" *is*, only how to bootstrap/migrate raw tables; see this
+#: module's own docstring.
+_LOCAL_HOST_KEY = "local"
+_LOCAL_HOST_DISPLAY_NAME = "Local Host"
 
 
 class PersistenceError(RuntimeError):
@@ -123,7 +136,7 @@ def default_database_path(
     return path
 
 
-def open_database(path: str | Path) -> sqlite3.Connection:
+def open_database(path: str | Path, *, check_same_thread: bool = True) -> sqlite3.Connection:
     """Open (creating if necessary) the Argus SQLite database at ``path``.
 
     Enables foreign keys and WAL journaling, then ensures the schema
@@ -131,10 +144,30 @@ def open_database(path: str | Path) -> sqlite3.Connection:
     creation is idempotent (``CREATE TABLE IF NOT EXISTS``), so
     reopening an already-initialized database never wipes or recreates
     its tables.
+
+    ``check_same_thread=False``: ``argus.api.dependencies.get_repository``
+    passes this for every request. FastAPI resolves a sync ``yield``
+    dependency (opening the connection) and runs the sync route handler
+    (using it) as two *separate* ``run_in_threadpool`` dispatches --
+    anyio's thread pool is free to hand each dispatch a different
+    worker thread, so "opened on thread A, used on thread B" is a real
+    observed failure mode under genuine concurrent load
+    (``sqlite3.ProgrammingError: SQLite objects created in a thread can
+    only be used in that same thread``), not just a theoretical one for
+    the SSE endpoint's long-lived, repeatedly-polled connection this
+    flag was originally added for. Safe to disable here because access
+    within one request/one poll stays strictly sequential either way --
+    never the genuinely concurrent multi-thread access
+    ``check_same_thread`` exists to catch. Every caller *outside*
+    ``argus.api`` (the CLI, the collector, ``argus.ai.explain``) keeps
+    the default ``True`` -- each of those is a single long-running
+    process using its own connection from one thread for its whole
+    lifetime, where the check is exactly the safety net it's meant to
+    be.
     """
 
     try:
-        connection = sqlite3.connect(str(path))
+        connection = sqlite3.connect(str(path), check_same_thread=check_same_thread)
     except sqlite3.Error as exc:
         raise DatabaseOpenError(f"could not open database at {path!r}: {exc}") from exc
 
@@ -200,6 +233,14 @@ def initialize_database(connection: sqlite3.Connection) -> None:
         # `incident_explanations` with `provider` as a real column, so
         # its indexes are safe to create right now.
         _create_incident_explanations_indexes(connection)
+        # Also already created `hosts`/`applications.host_id`/
+        # `containers.host_id` in their final (v8) shape -- a brand new
+        # database has no pre-existing application/container rows to
+        # backfill, so only the local host row itself and the two
+        # `host_id` indexes (see schema.sql's own comment on why they
+        # aren't in the unconditional script) need to happen here.
+        _ensure_local_host(connection)
+        _create_host_indexes(connection)
         connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         return
 
@@ -345,6 +386,160 @@ def _migrate_v5_to_v6(connection: sqlite3.Connection) -> None:
     connection.execute("PRAGMA user_version = 6")
 
 
+def _ensure_local_host(connection: sqlite3.Connection) -> int:
+    """Idempotently ensures the one synthetic ``'local'`` host row
+    exists, and returns its id.
+
+    Called both from the brand-new-database path above and from
+    `_migrate_v7_to_v8` below -- the same "insert if absent, otherwise
+    leave alone" logic either way, so a genuinely fresh database and a
+    migrated pre-Milestone-16 database converge on exactly the same
+    local-host row shape. `first_seen_at`/`last_seen_at` are stamped
+    with the current wall clock at the moment this runs (schema
+    bootstrap has no injected clock to read instead -- every other
+    timestamp this module ever writes, e.g. nothing, is otherwise
+    always supplied by a caller; this is the one deliberate exception,
+    justified by there being no meaningful "when did this host first
+    exist" fact to backfill from for a database that predates hosts
+    entirely). `Repository.record_host_heartbeat` (called by the real
+    collector loop on its very next tick) immediately advances
+    `last_seen_at` to a real, injected tick timestamp anyway.
+    """
+
+    existing = connection.execute(
+        "SELECT id FROM hosts WHERE host_key = ?", (_LOCAL_HOST_KEY,)
+    ).fetchone()
+    if existing is not None:
+        return existing["id"]
+
+    now_text = datetime.now(timezone.utc).isoformat()
+    cursor = connection.execute(
+        "INSERT INTO hosts (host_key, agent_id, display_name, kind, agent_token_hash, agent_version, "
+        "first_seen_at, last_seen_at) VALUES (?, NULL, ?, 'local', NULL, NULL, ?, ?)",
+        (_LOCAL_HOST_KEY, _LOCAL_HOST_DISPLAY_NAME, now_text, now_text),
+    )
+    return cursor.lastrowid
+
+
+def _ensure_hosts_columns(connection: sqlite3.Connection) -> None:
+    """Guarantees every Milestone-16 ``hosts`` column exists, no matter
+    what shape the table was already in when this connection was
+    opened.
+
+    This is the actual fix for the real-world v7 -> v8 migration bug
+    (``sqlite3.OperationalError: table hosts has no column named
+    agent_id``): `initialize_database` always runs `schema.sql`'s
+    `CREATE TABLE IF NOT EXISTS hosts (...)` first, and that statement
+    is a no-op the instant a `hosts` table already exists *in any
+    shape*. For every earlier "new table" migration in this file
+    (`collector_state`, `health_transitions`/`incidents`,
+    `incident_evidence`/..., `incident_explanations`,
+    `realtime_events`), that was safe to rely on, because none of those
+    tables could possibly have existed before their own milestone
+    introduced them -- a genuine vN database simply never had a
+    `collector_state` row's evidence columns, full stop. `hosts` breaks
+    that assumption: a database can carry a `hosts` table that predates
+    the *current* build's full v8 column set while still reporting
+    `user_version = 7` -- e.g. an earlier, in-progress build of this
+    same Milestone 16 work created the table (and inserted the one
+    `'local'` row) before `agent_id`/`agent_token_hash`/`agent_version`
+    existed in `schema.sql` at all, and the process exited (or simply
+    hadn't yet reached the final `PRAGMA user_version = 8`) before the
+    version bump landed. Reopening that database later, once
+    `schema.sql` has moved on to the full v8 shape, hits exactly this:
+    `CREATE TABLE IF NOT EXISTS` leaves the old, narrower table alone,
+    and `_ensure_local_host`'s `INSERT` (which names every v8 column)
+    fails outright.
+
+    So `_migrate_v7_to_v8` cannot assume `hosts` already has its final
+    shape the way every earlier migration could assume of *its* new
+    table -- it has to guarantee that shape itself, in the same
+    per-column-guarded idiom `_migrate_v3_to_v4` already uses for
+    `collector_state`. Nothing here is destructive: every branch only
+    ever *adds* a column that is missing, never drops or rewrites one
+    that is already there, so running this against an already-correct
+    v8 `hosts` table (e.g. a second call, or a database that never hit
+    the bug) is a pure no-op.
+
+    `agent_id` cannot be widened back to a `UNIQUE` column via `ALTER
+    TABLE ... ADD COLUMN` -- SQLite refuses a `UNIQUE`/`PRIMARY KEY`
+    constraint on an added column. A `CREATE UNIQUE INDEX IF NOT
+    EXISTS` gives the identical guarantee instead (SQLite's unique
+    index already treats every `NULL` as distinct from every other
+    `NULL`, same as the inline `UNIQUE` column constraint would).
+
+    The `NOT NULL` defaults below (`'local'`, `'Local Host'`, the
+    1970-01-01 sentinel) only matter for the pathological case of a
+    `hosts` row that predates *those* columns too -- for the realistic
+    case (only `agent_id` missing), the one pre-existing `'local'` row
+    already has real values for all of them, and this function never
+    touches a column that's already present.
+    """
+
+    existing = {row["name"] for row in connection.execute("PRAGMA table_info(hosts)")}
+    for column, ddl in (
+        ("agent_id", "ALTER TABLE hosts ADD COLUMN agent_id TEXT"),
+        ("display_name", "ALTER TABLE hosts ADD COLUMN display_name TEXT NOT NULL DEFAULT 'Local Host'"),
+        ("kind", "ALTER TABLE hosts ADD COLUMN kind TEXT NOT NULL DEFAULT 'local'"),
+        ("agent_token_hash", "ALTER TABLE hosts ADD COLUMN agent_token_hash TEXT"),
+        ("agent_version", "ALTER TABLE hosts ADD COLUMN agent_version TEXT"),
+        ("first_seen_at", "ALTER TABLE hosts ADD COLUMN first_seen_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00+00:00'"),
+        ("last_seen_at", "ALTER TABLE hosts ADD COLUMN last_seen_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00+00:00'"),
+    ):
+        if column not in existing:
+            connection.execute(ddl)
+
+    connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_hosts_agent_id ON hosts(agent_id)")
+
+
+def _migrate_v7_to_v8(connection: sqlite3.Connection) -> None:
+    """v7 -> v8 (Milestone 16): adds `hosts` (already created by the
+    shared schema script -- but see `_ensure_hosts_columns` for why
+    that alone is not actually sufficient) and `host_id` on
+    `applications`/`containers`.
+
+    Unlike `_migrate_v5_to_v6`, `applications`/`containers` genuinely
+    only need a plain, additive `ALTER TABLE ... ADD COLUMN` -- see
+    schema.sql's own comments on why neither table's uniqueness
+    constraint needed to change. Every pre-existing application/
+    container row is backfilled to the local host (see
+    `_ensure_local_host`) -- this is a statement of historical fact,
+    not a guess: nothing before Milestone 16 could have come from
+    anywhere but the one machine Argus was running on. No existing key,
+    name, or observation is touched.
+    """
+
+    _ensure_hosts_columns(connection)
+    local_host_id = _ensure_local_host(connection)
+
+    existing_app_columns = {row["name"] for row in connection.execute("PRAGMA table_info(applications)")}
+    if "host_id" not in existing_app_columns:
+        connection.execute("ALTER TABLE applications ADD COLUMN host_id INTEGER REFERENCES hosts(id)")
+    connection.execute("UPDATE applications SET host_id = ? WHERE host_id IS NULL", (local_host_id,))
+
+    existing_container_columns = {row["name"] for row in connection.execute("PRAGMA table_info(containers)")}
+    if "host_id" not in existing_container_columns:
+        connection.execute("ALTER TABLE containers ADD COLUMN host_id INTEGER REFERENCES hosts(id)")
+    connection.execute("UPDATE containers SET host_id = ? WHERE host_id IS NULL", (local_host_id,))
+
+    _create_host_indexes(connection)
+
+    connection.execute("PRAGMA user_version = 8")
+
+
+def _create_host_indexes(connection: sqlite3.Connection) -> None:
+    """The two `host_id` indexes -- split out of `schema.sql`'s own
+    unconditional script for the same reason
+    `_create_incident_explanations_indexes` is (see that function's own
+    docstring, and schema.sql's comment just above where these used to
+    live). Called once for a brand-new database and once from
+    `_migrate_v7_to_v8`, each only after `host_id` is guaranteed to
+    exist on both tables."""
+
+    connection.execute("CREATE INDEX IF NOT EXISTS ix_applications_host ON applications(host_id)")
+    connection.execute("CREATE INDEX IF NOT EXISTS ix_containers_host ON containers(host_id)")
+
+
 def _create_incident_explanations_indexes(connection: sqlite3.Connection) -> None:
     """Creates the two `incident_explanations` indexes that reference
     `provider` -- split out of `schema.sql`'s own unconditional script
@@ -367,6 +562,16 @@ def _create_incident_explanations_indexes(connection: sqlite3.Connection) -> Non
     )
 
 
+def _migrate_v6_to_v7(connection: sqlite3.Connection) -> None:
+    """v6 -> v7 (Milestone 15): adds `realtime_events` (already created
+    by the shared schema script -- see its own comment). Purely
+    additive, like v1->v2/v2->v3/v4->v5 before it: no existing table,
+    column, or row is touched, so this is just the explicit version
+    bump."""
+
+    connection.execute("PRAGMA user_version = 7")
+
+
 # Ordered so a database more than one version behind could, in principle,
 # walk forward one step at a time.
 _MIGRATIONS: tuple[_Migration, ...] = (
@@ -375,6 +580,8 @@ _MIGRATIONS: tuple[_Migration, ...] = (
     _Migration(from_version=3, to_version=4, apply=_migrate_v3_to_v4),
     _Migration(from_version=4, to_version=5, apply=_migrate_v4_to_v5),
     _Migration(from_version=5, to_version=6, apply=_migrate_v5_to_v6),
+    _Migration(from_version=6, to_version=7, apply=_migrate_v6_to_v7),
+    _Migration(from_version=7, to_version=8, apply=_migrate_v7_to_v8),
 )
 
 

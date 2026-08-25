@@ -1,20 +1,26 @@
-"""The six live prerequisite checks behind ``argus doctor``.
+"""The seven live prerequisite checks behind ``argus doctor``.
 
 Fixed, deterministic order -- never reordered by status:
 
     configuration -> database -> docker_connection -> docker_read_access
-    -> collector_heartbeat -> clock
+    -> collector_heartbeat -> remote_agents -> clock
 
 ``docker_read_access`` is skipped (not failed) when ``docker_connection``
-already failed; ``collector_heartbeat`` is skipped when ``database``
-already failed -- there is nothing trustworthy to check in either case,
-and reporting a fabricated FAIL for a check that never actually ran
-would misrepresent what Argus knows. ``clock``'s own runtime sanity
-(does this process produce a UTC-aware ``now``) is independent of the
-database and always runs; only its two DB-derived sub-checks
-(future ``last_tick_at``, impossible ``last_success_at``/``last_tick_at``
-ordering) are skipped in substance -- not flagged -- when there is no
-collector state to compare against.
+already failed; ``collector_heartbeat``/``remote_agents`` are skipped
+when ``database`` already failed -- there is nothing trustworthy to
+check in either case, and reporting a fabricated FAIL for a check that
+never actually ran would misrepresent what Argus knows. ``clock``'s own
+runtime sanity (does this process produce a UTC-aware ``now``) is
+independent of the database and always runs; only its two DB-derived
+sub-checks (future ``last_tick_at``, impossible ``last_success_at``/
+``last_tick_at`` ordering) are skipped in substance -- not flagged --
+when there is no collector state to compare against.
+
+``remote_agents`` (Milestone 16) is the one check that can never fail
+the overall ``result.operational`` verdict on its own -- see its own
+docstring: 0 configured agents is a normal single-host installation,
+and a stale/offline agent WARNs rather than FAILs, since the rest of
+Argus keeps working regardless of any one remote agent's connectivity.
 """
 
 from __future__ import annotations
@@ -28,12 +34,20 @@ from typing import Callable, Optional
 
 from argus.collectors.docker_client import DockerClient, DockerUnavailableError
 from argus.domain.health import DEFAULT_HEALTH_RULES, HealthRules
+from argus.domain.host import HostStatus, evaluate_host_status
 from argus.store.database import (
     SCHEMA_VERSION,
     inspect_database_readonly,
     open_database_readonly,
 )
 from argus.store.repository import Repository
+
+#: See `check_remote_agents`'s own docstring for why this can't reuse a
+#: single collector-config constant the way `check_collector_heartbeat`
+#: reuses `rules.unknown_after` -- an agent host's real poll interval
+#: isn't persisted centrally in v1 (see `argus.cli.queries`'s identical
+#: constant and its own docstring for the same reasoning).
+_AGENT_STATUS_POLL_INTERVAL_SECONDS = 15.0
 
 __all__ = [
     "CheckStatus",
@@ -284,7 +298,65 @@ def check_collector_heartbeat(
 
 
 # --------------------------------------------------------------------------
-# Check 6 -- Clock / timestamp sanity
+# Check 6 -- Remote agents (Milestone 16)
+# --------------------------------------------------------------------------
+
+
+def check_remote_agents(db_path, *, database_ok: bool, now: datetime) -> DoctorCheck:
+    """Summarizes every *registered remote agent* host's connectivity --
+    never the local host (which `collector_heartbeat` already covers on
+    its own terms), and never a reason for overall `argus doctor` to
+    FAIL just because no remote agents happen to be configured at all
+    (see the milestone's own "Do not make overall Argus doctor FAIL
+    simply because no remote agents are configured").
+
+    * database unavailable -> SKIP, same as `collector_heartbeat`.
+    * no agent hosts registered -> PASS ("0 remote agents configured" is
+      a completely normal, single-host installation).
+    * every registered agent host ONLINE -> PASS.
+    * one or more STALE/OFFLINE -> WARN, never FAIL -- a remote agent
+      going quiet is real degraded visibility into *that* host, not a
+      reason to call the whole rest of Argus non-operational (the local
+      collector, its own applications, and the dashboard/API keep
+      working regardless of any one remote agent's connectivity).
+    """
+
+    if not database_ok:
+        return DoctorCheck("remote_agents", CheckStatus.SKIP, "skipped: database unavailable")
+
+    try:
+        connection = open_database_readonly(db_path)
+    except sqlite3.Error as exc:
+        return DoctorCheck("remote_agents", CheckStatus.FAIL, f"could not read host state: {exc}")
+    try:
+        hosts = [h for h in Repository(connection).list_hosts() if h.kind == "agent"]
+    finally:
+        connection.close()
+
+    if not hosts:
+        return DoctorCheck("remote_agents", CheckStatus.PASS, "0 remote agents configured")
+
+    statuses = {
+        host.host_key: evaluate_host_status(
+            last_seen_at=host.last_seen_at, now=now, poll_interval_seconds=_AGENT_STATUS_POLL_INTERVAL_SECONDS
+        )
+        for host in hosts
+    }
+    online = sum(1 for s in statuses.values() if s is HostStatus.ONLINE)
+    not_online = {key: status.value for key, status in statuses.items() if status is not HostStatus.ONLINE}
+
+    if not not_online:
+        return DoctorCheck("remote_agents", CheckStatus.PASS, f"{online}/{len(hosts)} remote agent(s) ONLINE")
+
+    detail = ", ".join(f"{key} ({status})" for key, status in sorted(not_online.items()))
+    return DoctorCheck(
+        "remote_agents", CheckStatus.WARN,
+        f"{online}/{len(hosts)} remote agent(s) ONLINE -- not online: {detail}",
+    )
+
+
+# --------------------------------------------------------------------------
+# Check 7 -- Clock / timestamp sanity
 # --------------------------------------------------------------------------
 
 
@@ -372,6 +444,9 @@ def run_checks(
     heartbeat_check = check_collector_heartbeat(
         db_path, database_ok=database_check.status is CheckStatus.PASS, now=now, rules=rules
     )
+    remote_agents_check = check_remote_agents(
+        db_path, database_ok=database_check.status is CheckStatus.PASS, now=now
+    )
     clock_check = check_clock(db_path, database_ok=database_check.status is CheckStatus.PASS, now=now)
 
     return DoctorResult(
@@ -381,6 +456,7 @@ def run_checks(
             docker_connection_check,
             docker_read_check,
             heartbeat_check,
+            remote_agents_check,
             clock_check,
         )
     )

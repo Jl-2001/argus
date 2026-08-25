@@ -163,7 +163,7 @@ def all_transitions(conn: sqlite3.Connection, scope: str | None = None) -> list[
 class TestSchemaMigrationV2ToV3:
     def test_fresh_database_has_health_transitions_and_incidents(self, tmp_path):
         conn = open_database(tmp_path / "a.db")
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 6  # SCHEMA_VERSION moved to 6 in Milestone 12.1 (multi-provider AI)
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 8  # SCHEMA_VERSION moved to 8 in Milestone 16 (multi-host agents)
         tables = {
             row["name"]
             for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
@@ -199,7 +199,7 @@ class TestSchemaMigrationV2ToV3:
         v2_conn.close()
 
         conn = open_database(db_path)
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 6  # SCHEMA_VERSION moved to 6 in Milestone 12.1 (multi-provider AI)
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 8  # SCHEMA_VERSION moved to 8 in Milestone 16 (multi-host agents)
         tables = {
             row["name"]
             for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
@@ -219,7 +219,7 @@ class TestSchemaMigrationV2ToV3:
         conn.close()
 
         conn2 = open_database(db_path)
-        assert conn2.execute("PRAGMA user_version").fetchone()[0] == 6  # SCHEMA_VERSION moved to 6 in Milestone 12.1 (multi-provider AI)
+        assert conn2.execute("PRAGMA user_version").fetchone()[0] == 8  # SCHEMA_VERSION moved to 8 in Milestone 16 (multi-host agents)
         assert Repository(conn2).get_application("cnstrct") is not None
         conn2.close()
 
@@ -490,6 +490,105 @@ class TestIncidentLifecycleSequences:
 
         assert results[0].incidents_resolved == 0
         assert all_incidents(conn) == []
+        conn.close()
+
+
+# --------------------------------------------------------------------------
+# Milestone 15 -- IncidentProcessingResult's additive detail fields
+# (transitions/opened_incidents/updated_incidents/resolved_incidents),
+# the real data argus.realtime.emitter turns into events. Unlike
+# test_realtime_emitter.py (which hand-builds an IncidentProcessingResult
+# to test the emitter in isolation), these tests drive the real engine
+# end to end and check *it* populates the tuples correctly.
+# --------------------------------------------------------------------------
+
+
+class TestRealtimeDetailFields:
+    def test_every_committed_transition_is_recorded_with_its_real_identifiers(self, tmp_path):
+        conn = open_database(tmp_path / "a.db")
+        repo = Repository(conn)
+        results = run_sequence(repo, [HealthStatus.HEALTHY, HealthStatus.UNHEALTHY])
+
+        # tick 0: application/service/container all go None -> HEALTHY (3 transitions)
+        assert len(results[0].transitions) == 3
+        assert {t.scope for t in results[0].transitions} == {"application", "service", "container"}
+        for t in results[0].transitions:
+            assert t.from_status is None
+            assert t.to_status is HealthStatus.HEALTHY
+            assert t.application_key == "cnstrct"
+            assert isinstance(t.transition_id, int)
+
+        # tick 1: HEALTHY -> UNHEALTHY (3 more transitions, this time with a real from_status)
+        assert len(results[1].transitions) == 3
+        for t in results[1].transitions:
+            assert t.from_status is HealthStatus.HEALTHY
+            assert t.to_status is HealthStatus.UNHEALTHY
+        conn.close()
+
+    def test_an_unchanged_status_records_no_transition(self, tmp_path):
+        conn = open_database(tmp_path / "a.db")
+        repo = Repository(conn)
+        results = run_sequence(repo, [HealthStatus.HEALTHY, HealthStatus.HEALTHY])
+        assert results[1].transitions == ()
+        conn.close()
+
+    def test_full_escalation_deescalation_resolve_sequence(self, tmp_path):
+        conn = open_database(tmp_path / "a.db")
+        repo = Repository(conn)
+        results = run_sequence(
+            repo,
+            [
+                HealthStatus.HEALTHY,      # 0: no incident
+                HealthStatus.DEGRADED,     # 1: opens
+                HealthStatus.UNHEALTHY,    # 2: escalates (worst DEGRADED -> UNHEALTHY)
+                HealthStatus.DEGRADED,     # 3: real transition, NOT an escalation (worst stays UNHEALTHY)
+                HealthStatus.UNHEALTHY,    # 4: real transition, NOT an escalation (worst already UNHEALTHY)
+                HealthStatus.HEALTHY,      # 5: resolves
+            ],
+        )
+
+        assert results[0].opened_incidents == () and results[0].updated_incidents == () and results[0].resolved_incidents == ()
+
+        assert len(results[1].opened_incidents) == 1
+        assert results[1].opened_incidents[0].opening_status is HealthStatus.DEGRADED
+        assert results[1].opened_incidents[0].application_key == "cnstrct"
+        assert results[1].updated_incidents == ()
+
+        assert results[2].opened_incidents == ()
+        assert len(results[2].updated_incidents) == 1
+        assert results[2].updated_incidents[0].worst_status is HealthStatus.UNHEALTHY
+
+        # -- the two "no duplicate update" cases: a real, committed
+        # transition happened, but since it wasn't worse than the
+        # incident's already-recorded worst_status, no updated_incidents
+        # entry is appended (this is the "no duplicate/no every-poll
+        # update" guarantee the realtime layer relies on) --
+        assert results[3].transitions != ()
+        assert results[3].updated_incidents == ()
+        assert results[4].transitions != ()
+        assert results[4].updated_incidents == ()
+
+        assert results[5].opened_incidents == () and results[5].updated_incidents == ()
+        assert len(results[5].resolved_incidents) == 1
+        assert results[5].resolved_incidents[0].application_key == "cnstrct"
+
+        incident_ids = {
+            results[1].opened_incidents[0].incident_id,
+            results[2].updated_incidents[0].incident_id,
+            results[5].resolved_incidents[0].incident_id,
+        }
+        assert len(incident_ids) == 1  # all refer to the exact same incident
+        conn.close()
+
+    def test_first_ever_null_to_healthy_transition_opens_no_incident(self, tmp_path):
+        """HEALTHY never opens an incident (see _update_incident_lifecycle) --
+        confirms the detail-field extension didn't change that."""
+
+        conn = open_database(tmp_path / "a.db")
+        repo = Repository(conn)
+        [result] = run_sequence(repo, [HealthStatus.HEALTHY])
+        assert len(result.transitions) == 3  # application/service/container all recorded
+        assert result.opened_incidents == ()
         conn.close()
 
 

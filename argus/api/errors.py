@@ -23,8 +23,14 @@ __all__ = [
     "APIError",
     "application_not_found",
     "incident_not_found",
+    "host_not_found",
     "database_unavailable",
     "invalid_query_parameter",
+    "invalid_agent_credentials",
+    "host_identity_mismatch",
+    "malformed_snapshot",
+    "unsupported_protocol_version",
+    "snapshot_too_large",
     "register_exception_handlers",
 ]
 
@@ -72,6 +78,48 @@ def database_unavailable(detail: str) -> APIError:
 
 def invalid_query_parameter(message: str) -> APIError:
     return APIError(code="invalid_query_parameter", message=message, status_code=422)
+
+
+def host_not_found(host_key: str) -> APIError:
+    return APIError(code="host_not_found", message=f"Host {host_key!r} was not found.", status_code=404)
+
+
+def invalid_agent_credentials() -> APIError:
+    # Milestone 16's own "Invalid credentials: HTTP 401, generic
+    # message, no indication which part of token was wrong" -- never
+    # "unknown agent_id" vs. "wrong token" vs. "unknown host_key" as
+    # distinct messages, which would let a caller enumerate valid agent
+    # ids/host keys by watching which generic-sounding error changes.
+    return APIError(
+        code="invalid_agent_credentials", message="Agent authentication failed.", status_code=401
+    )
+
+
+def host_identity_mismatch() -> APIError:
+    # Milestone 16's own "Known agent but wrong host identity: HTTP
+    # 403" -- the token authenticated fine, but the `host_key` in the
+    # snapshot body doesn't match the host that token was issued for.
+    return APIError(
+        code="host_identity_mismatch",
+        message="The authenticated agent does not match the snapshot's declared host.",
+        status_code=403,
+    )
+
+
+def malformed_snapshot(detail: str) -> APIError:
+    return APIError(code="malformed_snapshot", message=f"Malformed agent snapshot: {detail}", status_code=400)
+
+
+def unsupported_protocol_version(version: object) -> APIError:
+    return APIError(
+        code="unsupported_protocol_version",
+        message=f"Unsupported agent protocol_version: {version!r}.",
+        status_code=400,
+    )
+
+
+def snapshot_too_large(detail: str) -> APIError:
+    return APIError(code="snapshot_too_large", message=f"Agent snapshot rejected: {detail}", status_code=400)
 
 
 def _envelope(code: str, message: str) -> dict:

@@ -157,5 +157,6 @@ class TestPackageDiscovery:
         names = {name.rsplit(".", 1)[-1] for name in _module_names(argus.api)}
         assert {
             "app", "config", "dependencies", "errors", "models",
-            "system", "doctor", "applications", "incidents", "evidence", "bundles", "explanations",
+            "system", "doctor", "applications", "incidents", "evidence", "bundles", "explanations", "events",
+            "hosts", "agents",
         } <= names

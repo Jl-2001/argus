@@ -25,6 +25,7 @@ from argus.doctor.checks import (
     check_database,
     check_docker_connection,
     check_docker_read_access,
+    check_remote_agents,
     run_checks,
 )
 from argus.domain.health import DEFAULT_HEALTH_RULES
@@ -270,6 +271,53 @@ class TestCollectorHeartbeatCheck:
 
 
 # --------------------------------------------------------------------------
+# Remote agents (Milestone 16)
+# --------------------------------------------------------------------------
+
+
+class TestRemoteAgentsCheck:
+    def test_skipped_when_database_unavailable(self, tmp_path):
+        result = check_remote_agents(tmp_path / "a.db", database_ok=False, now=NOW)
+        assert result.status is CheckStatus.SKIP
+
+    def test_no_agents_configured_passes(self, tmp_path):
+        db_path = tmp_path / "a.db"
+        open_database(db_path).close()
+        result = check_remote_agents(db_path, database_ok=True, now=NOW)
+        assert result.status is CheckStatus.PASS
+        assert "0 remote agents" in result.message
+
+    def test_all_online_passes(self, tmp_path):
+        db_path = tmp_path / "a.db"
+        conn = open_database(db_path)
+        Repository(conn).create_agent_host(
+            host_key="dell", agent_id="agent-1", display_name="Dell", token_hash="x" * 64, now=NOW
+        )
+        conn.close()
+        result = check_remote_agents(db_path, database_ok=True, now=NOW)
+        assert result.status is CheckStatus.PASS
+
+    def test_offline_agent_warns_never_fails(self, tmp_path):
+        db_path = tmp_path / "a.db"
+        conn = open_database(db_path)
+        Repository(conn).create_agent_host(
+            host_key="dell", agent_id="agent-1", display_name="Dell", token_hash="x" * 64,
+            now=NOW - timedelta(hours=1),
+        )
+        conn.close()
+        result = check_remote_agents(db_path, database_ok=True, now=NOW)
+        assert result.status is CheckStatus.WARN
+        assert "dell" in result.message
+
+    def test_local_host_is_never_reported_as_a_remote_agent(self, tmp_path):
+        db_path = tmp_path / "a.db"
+        open_database(db_path).close()  # bootstraps the local host only
+        result = check_remote_agents(db_path, database_ok=True, now=NOW)
+        assert result.status is CheckStatus.PASS
+        assert "0 remote agents" in result.message
+
+
+# --------------------------------------------------------------------------
 # Clock
 # --------------------------------------------------------------------------
 
@@ -391,6 +439,7 @@ class TestRunChecks:
             "docker_connection",
             "docker_read_access",
             "collector_heartbeat",
+            "remote_agents",
             "clock",
         ]
 

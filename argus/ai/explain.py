@@ -30,6 +30,7 @@ from argus.ai.prompts import PROMPT_VERSION
 from argus.ai.providers.base import DEFAULT_AI_CONFIG, AIConfig, AIProvider, AIUsage
 from argus.ai.validation import ExplanationValidationError, validate_explanation
 from argus.evidence.assembler import DEFAULT_ASSEMBLER_CONFIG, AssemblerConfig, assemble_evidence_bundle
+from argus.realtime.emitter import emit_explanation_available
 from argus.store.database import DuplicateExplanationError
 from argus.store.repository import Repository
 
@@ -143,6 +144,14 @@ class IncidentExplanationService:
                 root_cause=explanation.root_cause_claim.text if explanation.root_cause_claim is not None else None,
                 confidence=explanation.confidence.value, input_tokens=raw_response.usage.input_tokens,
                 output_tokens=raw_response.usage.output_tokens, response_json=_dump_response_json(explanation),
+            )
+            # Announces an *already-persisted* explanation -- see
+            # argus.realtime.emitter.emit_explanation_available's own
+            # docstring on why this never triggers generation itself and
+            # never fails this method if the event write itself fails.
+            emit_explanation_available(
+                self._repository, incident_id=incident_id, provider=provider_name,
+                model=self._ai_config.model, bundle_fingerprint=bundle.metadata.fingerprint, now=now,
             )
         except DuplicateExplanationError:
             # Only reachable via `force_refresh=True` against evidence
