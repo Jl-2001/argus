@@ -1,0 +1,51 @@
+# Argus dashboard (web/) -- systemd --user unit template.
+#
+# This is a TEMPLATE, not a working file. Copy it, fill in every
+# <ARGUS_WEB_HOME> and <NPM_PATH> placeholder, then install it -- see
+# docs/multi-host-deployment.md. Do not commit the filled-in copy.
+#
+# Runs the Vite dev server on this (remote/Dell) host, listening on
+# 5174 so it doesn't collide with a control-plane-local dashboard on
+# the default 5173 -- see README.md's CORS origins, which already
+# allow both ports.
+#
+# <NPM_PATH> is the full path to your `npm` binary, e.g. from
+# `which npm` -- if you use nvm, this is typically something like
+# ~/.nvm/versions/node/<version>/bin/npm. systemd --user units don't
+# source your shell profile, so a bare `npm` on PATH will not resolve;
+# use the absolute path.
+#
+# The dashboard reaching the control plane across the SSH reverse
+# tunnel depends on web/.env.local (NOT this unit) containing:
+#   VITE_ARGUS_API_URL=http://127.0.0.1:18088
+# web/.env.local is already covered by web/.gitignore's `*.local`
+# pattern -- create it locally on the remote host, never commit it.
+# See docs/multi-host-deployment.md's troubleshooting section for why
+# this is needed (the dashboard's own default is 127.0.0.1:8088,
+# which is only reachable on the control-plane machine itself).
+#
+# Install (systemd --user):
+#   mkdir -p ~/.config/systemd/user
+#   cp argus-web.service.example ~/.config/systemd/user/argus-web.service
+#   # edit every placeholder in the copy
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now argus-web.service
+#
+# Same lingering requirement as argus-agent.service.example applies
+# if this should survive logout/reboot:
+#   sudo loginctl enable-linger <user>
+
+[Unit]
+Description=Argus dashboard (Vite dev server)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=<ARGUS_WEB_HOME>
+ExecStart=<NPM_PATH> run dev -- --port 5174
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

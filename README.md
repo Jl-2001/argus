@@ -186,4 +186,28 @@ host (see `argus.store.database._migrate_v7_to_v8`), and every
 existing application `key` is completely unchanged (a local host's
 keys are never prefixed). Nothing is orphaned, nothing needs to be
 re-discovered.
+
+### Persistent multi-host deployment
+
+Multi-host monitoring, cross-host SSE, persistent services (macOS
+`launchd` for the control plane, `systemd --user` for a remote host),
+and reboot validation on both machines have all been run and
+confirmed working end to end, over an SSH reverse tunnel — see
+`docs/multi-host-deployment.md` for the full architecture, install
+steps, validation commands, and the specific issues found (Docker
+context drift, Docker Desktop's startup timing, the remote
+dashboard's API URL) and how they were resolved. Sanitized service
+templates live in `deploy/macos/` and `deploy/linux/`.
+
+| | Status |
+|---|---|
+| Multi-host monitoring | DONE |
+| Cross-host SSE | DONE |
+| Persistent services | DONE |
+| Reboot validation | DONE |
+
+Next up: richer host/topology views on top of the existing Hosts page
+and `ApplicationTopology` (see `web/src/pages/HostsPage.tsx` and
+`web/src/components/topology/ApplicationTopology.tsx`'s own docstring,
+"the first, deliberately literal Argus topology view").
 # argus

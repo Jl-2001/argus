@@ -1,0 +1,49 @@
+# Argus agent -- systemd --user unit template.
+#
+# This is a TEMPLATE, not a working file. Copy it, fill in every
+# <ARGUS_HOME> and <ARGUS_AGENT_ENV_FILE> placeholder, then install it
+# -- see docs/multi-host-deployment.md for the full walkthrough. Do
+# not commit the filled-in copy.
+#
+# Intended to run as a *user* service (systemd --user), not a system
+# service: it needs no root privileges, and it should run under the
+# same account that can already read the local Docker socket (see
+# `docker context show` / `id` in docs/multi-host-deployment.md's
+# troubleshooting section for the group-membership check).
+#
+# Equivalent to running, from <ARGUS_HOME>:
+#   .venv/bin/argus-agent
+# with ARGUS_AGENT_ID / ARGUS_AGENT_TOKEN / ARGUS_HOST_KEY /
+# ARGUS_CONTROL_PLANE_URL (and optionally ARGUS_HOST_NAME /
+# ARGUS_AGENT_POLL_INTERVAL) already exported -- see
+# argus/agent/config.py and argus-agent.env.example in this directory.
+#
+# Install (systemd --user):
+#   mkdir -p ~/.config/systemd/user
+#   cp argus-agent.service.example ~/.config/systemd/user/argus-agent.service
+#   # edit every placeholder in the copy
+#   cp argus-agent.env.example ~/.config/argus/argus-agent.env   # outside the repo; see that file's own header
+#   chmod 600 ~/.config/argus/argus-agent.env
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now argus-agent.service
+#
+# For the service to survive logout/reboot on a headless or
+# rarely-logged-in-to machine, enable lingering for this user once:
+#   sudo loginctl enable-linger <user>
+#   loginctl show-user <user> -p Linger   # expect Linger=yes
+
+[Unit]
+Description=Argus monitoring agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=<ARGUS_HOME>
+EnvironmentFile=<ARGUS_AGENT_ENV_FILE>
+ExecStart=<ARGUS_HOME>/.venv/bin/argus-agent
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

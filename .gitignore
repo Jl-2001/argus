@@ -8,3 +8,14 @@ data/
 *.egg-info/
 .DS_Store
 backups/
+
+# Real service configs derived from deploy/**/*.example templates
+# (agent tokens, host paths) -- never commit these; keep the real
+# files outside the repo (see docs/multi-host-deployment.md). This is
+# a safety net in case one ends up under deploy/ anyway.
+deploy/**/*.env
+!deploy/**/*.env.example
+deploy/**/*.plist
+!deploy/**/*.plist.example
+deploy/**/*.service
+!deploy/**/*.service.example

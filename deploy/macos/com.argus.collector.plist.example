@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Argus local collector -- macOS launchd user agent template.
+
+  This is a TEMPLATE, not a working file. Copy it, fill in every
+  <ARGUS_HOME> and <YOUR_USERNAME> placeholder, then install it -- see
+  docs/multi-host-deployment.md. Do not commit the filled-in copy.
+
+  Equivalent to running, from <ARGUS_HOME>:
+    .venv/bin/python -m argus.run_collector
+
+  IMPORTANT: on macOS this collector reads Docker through Docker
+  Desktop's socket (~/.docker/run/docker.sock, docker context
+  "desktop-linux"). If Docker Desktop has not finished starting yet
+  (e.g. right after login/reboot), the collector will report the
+  local host as STALE until the socket appears -- it recovers on its
+  own once Docker Desktop is up, no restart needed. Enable "Start
+  Docker Desktop when you sign in to your computer" in Docker
+  Desktop's settings so this collector has something to talk to at
+  boot. See docs/multi-host-deployment.md's troubleshooting section.
+
+  Install:
+    mkdir -p ~/Library/LaunchAgents
+    cp com.argus.collector.plist.example ~/Library/LaunchAgents/com.argus.collector.plist
+    # edit every placeholder in the copy
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.argus.collector.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.argus.collector</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/&lt;YOUR_USERNAME&gt;/&lt;ARGUS_HOME&gt;/.venv/bin/python</string>
+        <string>-m</string>
+        <string>argus.run_collector</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/&lt;YOUR_USERNAME&gt;/&lt;ARGUS_HOME&gt;</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/&lt;YOUR_USERNAME&gt;/&lt;ARGUS_HOME&gt;/logs/argus-collector.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/&lt;YOUR_USERNAME&gt;/&lt;ARGUS_HOME&gt;/logs/argus-collector.err.log</string>
+</dict>
+</plist>

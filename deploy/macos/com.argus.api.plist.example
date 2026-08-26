@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Argus API (control plane) -- macOS launchd user agent template.
+
+  This is a TEMPLATE, not a working file. Copy it, fill in every
+  <ARGUS_HOME> and <YOUR_USERNAME> placeholder with real paths, then
+  install it -- see docs/multi-host-deployment.md for the full
+  install/validate walkthrough. Do not commit the filled-in copy.
+
+  Equivalent to running, from <ARGUS_HOME>:
+    .venv/bin/argus-api
+  (see [project.scripts] in pyproject.toml and README.md's "API"
+  section for what that binds -- 127.0.0.1:8088 by default, never
+  0.0.0.0).
+
+  Install:
+    mkdir -p ~/Library/LaunchAgents
+    cp com.argus.api.plist.example ~/Library/LaunchAgents/com.argus.api.plist
+    # edit every placeholder in the copy
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.argus.api.plist
+
+  Reload after editing:
+    launchctl bootout gui/$(id -u)/com.argus.api
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.argus.api.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.argus.api</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/&lt;YOUR_USERNAME&gt;/&lt;ARGUS_HOME&gt;/.venv/bin/argus-api</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/&lt;YOUR_USERNAME&gt;/&lt;ARGUS_HOME&gt;</string>
+
+    <!--
+      Same CORS origins argus.api.config.DEFAULT_CORS_ORIGINS already
+      allows (localhost/127.0.0.1 on 5173 AND 5174 -- 5174 covers the
+      Dell-hosted dashboard's dev-server port in this deployment).
+      This is additive, not a change to the default: ARGUS_API_CORS_ORIGINS
+      simply lists the same origins argus.api.config.resolve_cors_origins
+      already accepts via that environment variable.
+    -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>ARGUS_API_CORS_ORIGINS</key>
+        <string>http://localhost:5173,http://127.0.0.1:5173,http://localhost:5174,http://127.0.0.1:5174</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/&lt;YOUR_USERNAME&gt;/&lt;ARGUS_HOME&gt;/logs/argus-api.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/&lt;YOUR_USERNAME&gt;/&lt;ARGUS_HOME&gt;/logs/argus-api.err.log</string>
+</dict>
+</plist>

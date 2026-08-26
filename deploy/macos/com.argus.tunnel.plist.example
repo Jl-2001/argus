@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Argus SSH reverse tunnel -- macOS launchd user agent template.
+
+  This is a TEMPLATE, not a working file. Copy it, fill in every
+  <REMOTE_USER> and <REMOTE_HOST> placeholder, then install it -- see
+  docs/multi-host-deployment.md. Do not commit the filled-in copy.
+
+  Equivalent to running:
+    ssh -N \
+      -o ExitOnForwardFailure=yes \
+      -o ServerAliveInterval=30 \
+      -o ServerAliveCountMax=3 \
+      -R 18088:127.0.0.1:8088 \
+      <REMOTE_USER>@<REMOTE_HOST>
+
+  Requires SSH key authentication to already work non-interactively
+  (ssh <REMOTE_USER>@<REMOTE_HOST> with no password/passphrase prompt)
+  -- launchd cannot answer an interactive prompt, so a tunnel relying
+  on one will silently fail to authenticate every time it's started.
+
+  What this does and does not expose:
+    - The remote host receives the Argus API ONLY on its own loopback
+      interface, 127.0.0.1:18088 -- never on a routable address.
+    - The Argus API itself is never bound to 0.0.0.0 on either
+      machine (see argus.api.config.DEFAULT_HOST).
+    - Docker is never forwarded through this tunnel or any other --
+      argus-agent reads Docker locally, on the remote host, over that
+      host's own Unix socket. The control plane never reaches into
+      the remote machine's Docker socket, directly or via this
+      tunnel.
+
+  Install:
+    mkdir -p ~/Library/LaunchAgents
+    cp com.argus.tunnel.plist.example ~/Library/LaunchAgents/com.argus.tunnel.plist
+    # edit every placeholder in the copy
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.argus.tunnel.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.argus.tunnel</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/ssh</string>
+        <string>-N</string>
+        <string>-o</string>
+        <string>ExitOnForwardFailure=yes</string>
+        <string>-o</string>
+        <string>ServerAliveInterval=30</string>
+        <string>-o</string>
+        <string>ServerAliveCountMax=3</string>
+        <string>-R</string>
+        <string>18088:127.0.0.1:8088</string>
+        <string>&lt;REMOTE_USER&gt;@&lt;REMOTE_HOST&gt;</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/&lt;YOUR_USERNAME&gt;/&lt;ARGUS_HOME&gt;/logs/argus-tunnel.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/&lt;YOUR_USERNAME&gt;/&lt;ARGUS_HOME&gt;/logs/argus-tunnel.err.log</string>
+</dict>
+</plist>
